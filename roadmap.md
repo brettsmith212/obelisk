@@ -14,6 +14,12 @@ The wedge is Obsidian-native. Existing Obsidian AI plugins on iPhone either depe
 **Shipping target:** TestFlight, for personal use and a small group of friends.
 **Time commitment:** Nights and weekends, ~year-long arc (used as a relative difficulty estimate, not a deadline).
 
+## UI / UX direction
+
+The full UI specification — design principles, visual language (Obsidian-native, dark-mode primary, purple accent, Inter + SF Mono), screen sketches, interaction patterns, status pill system, capture and Action Button flows, app icon direction — lives in [ui-spec.md](./ui-spec.md). The roadmap describes *what* gets built and in what order; the spec describes *how it looks and feels*.
+
+The governing rule for anything unspecified: **default to ChatGPT's iOS behavior.** Originality belongs in vault-awareness, citations, wikilinks, tool transparency, and Obsidian deep-linking — not in chat-shell mechanics.
+
 ## Model strategy: Foundation Models for v1, MLX as a power-user path
 
 Apple's Foundation Models framework (iOS 26+) gives third-party apps free, on-device access to Apple's ~3B-parameter foundation model — the same model that powers Apple Intelligence. It supports constrained tool calling, guided generation (`@Generable`), and LoRA adapters out of the box. Per Apple's [2025 tech report](https://machinelearning.apple.com/research/apple-foundation-models-tech-report-2025), the model is competitive with Qwen 2.5/3 3–4B and Gemma 3 4B at its size class.
@@ -431,47 +437,48 @@ User connects vault. Obelisk shows embedding progress. Once complete, the agent 
 
 ---
 
-## Phase D: Voice input (2–3 weeks)
+## Phase D: Voice input — live dictation (2–3 weeks)
 
-The model and tool layer don't change. You're just adding another way to populate the input field.
+The model and tool layer don't change. You're just adding another way to populate the input field. Voice is a **dictation convenience**, not a separate "voice mode" — it's a faster keyboard, not a walkie-talkie. See [ui-spec.md §4.4](./ui-spec.md) for the exact interaction.
 
 ### Goal
 
-A mic button in the chat input. Hold to record, release to transcribe. The transcribed text is sent through the existing agent. Optional spoken response via system TTS.
+A mic button in the chat input. Tap to start dictation: WhisperKit streams partial transcripts live into the input text field. Tap again to stop. The user reviews/edits the transcribed text and taps send manually. **No auto-send, no spoken response, no TTS.**
 
 ### Components
 
 - **AVAudioEngine** for capture. Sample rate matched to the Whisper model (16kHz).
-- **VAD (voice activity detection)** for endpointing — knowing when the user stopped talking. WhisperKit has built-in options; alternatively use a simple energy-based threshold to start.
-- **WhisperKit** for transcription. Picks the right CoreML-optimized Whisper variant for the device. Start with `openai_whisper-base.en` for speed; upgrade to `small` or `large-v3-turbo` if quality matters more.
-- **AVSpeechSynthesizer** for spoken responses. Built into iOS, decent quality, free.
+- **WhisperKit** for streaming transcription. Use its partial-result / streaming API so the text field updates as the user speaks, not after they stop. Pick the right CoreML-optimized Whisper variant for the device — start with `openai_whisper-base.en` for low latency; upgrade to `small` or `large-v3-turbo` if accuracy on multi-sentence dictation becomes the bottleneck.
+- **No VAD-driven endpointing.** Stopping dictation is a user gesture (tap the mic again or the stop square). Energy-based silence cutoff is explicitly not used — we don't want the field to "close" mid-thought.
+- **No TTS / AVSpeechSynthesizer.** Replies are always text. Voice output is a non-goal for v1.
 
 ### Resources
 
-- WhisperKit: `https://github.com/argmaxinc/WhisperKit` — has an iOS sample app
+- WhisperKit: `https://github.com/argmaxinc/WhisperKit` — has an iOS sample app and a streaming transcription example
 - AVAudioEngine docs: `https://developer.apple.com/documentation/avfaudio/avaudioengine`
 
 ### Pitfalls
 
-- **Audio session conflicts.** Background music, other apps, AirPods. Configure `AVAudioSession.Category.playAndRecord` carefully.
+- **Streaming vs. one-shot transcription.** Make sure you're using the streaming API and updating the input field incrementally. A one-shot transcribe-on-stop flow is the wrong UX even if it's simpler to wire up — the live-updating field is the entire point.
+- **Audio session conflicts.** Background music, other apps, AirPods. Configure `AVAudioSession.Category.playAndRecord` (or `.record` since we're not playing audio) carefully.
 - **Permission prompts.** Microphone permission needs Info.plist string and runtime request.
-- **VAD tuning.** Too sensitive and it cuts you off mid-thought; not sensitive enough and it sits waiting after you've stopped. Worth iterating on.
+- **Re-entrancy and editing.** The user can tap into the text field and edit while dictation is paused. Make sure stopping dictation leaves cleanly committed text, not a partial hypothesis that the next dictation session overwrites.
 
 ### Deliverable
 
-You can hold the mic button, speak a question, release, and have Obelisk respond. Speech-to-text is fast enough to feel responsive (~500ms for a short utterance on iPhone 16 Pro).
+Tap mic → speak → words appear in the input field as you talk → tap again to stop → edit if needed → tap send. Latency between speech and first visible token is short enough to feel responsive (~500ms on iPhone 16 Pro).
 
 ---
 
-## Phase E: Action Button + Shortcuts integration (3–4 weeks)
+## Phase E: Action Button, capture, and Shortcuts integration (3–4 weeks)
 
-Now Obelisk can be activated without opening the app, and Obelisk itself can drive other apps via user-configured Shortcuts.
+Now Obelisk can be activated without opening the app, content can be captured into the vault from anywhere in iOS, and Obelisk itself can drive other apps via user-configured Shortcuts. See [ui-spec.md §6 and §7](./ui-spec.md) for the exact flows.
 
 ### Goal
 
-Two-way Shortcuts integration: (1) the Action Button (or a Siri phrase, or the Shortcuts app) can launch Obelisk with a query, and (2) Obelisk can run user-defined Shortcuts as tools.
+Three integrations: (1) the Action Button opens Obelisk in a new chat with dictation already active, (2) Share Sheet + an `AppIntent` let the user capture content directly into `obelisk/inbox/` without opening the app, and (3) Obelisk can run user-defined Shortcuts as tools.
 
-### Direction 1: Obelisk as a Shortcut target
+### Direction 1: Obelisk as a Shortcut target — Action Button flow
 
 Define an `AppIntent` like `AskObeliskIntent` with a `query: String` parameter and a `perform` method that runs the agent and returns the result. Register it via an `AppShortcutsProvider`.
 
@@ -481,9 +488,26 @@ This automatically gets you:
 - The Action Button can be bound to it (user does this in Settings → Action Button → Shortcut)
 - Spotlight search surfaces it
 
-Add a "Voice mode" intent variant that opens Obelisk in voice-recording state immediately, so the Action Button flow is: hold button → Obelisk opens with mic active → speak → release → response.
+Add an Action Button intent variant whose `perform` method:
 
-### Direction 2: Obelisk triggers user Shortcuts
+1. **Opens the app directly into a brand-new conversation** (not the most recent one — never edit an existing thread by accident).
+2. **Starts dictation immediately** — the mic is already in the pulsing-red recording state when the chat appears, and WhisperKit streams partial transcripts straight into the input field per Phase D.
+3. **Does not auto-send.** The user reviews the transcription and taps send. Action Button presses are easy to fat-finger; we never want a half-thought silently fired at the model.
+
+So the full Action Button flow is: press Action Button → Obelisk opens in a new chat with mic live → speak → tap to stop dictation → review → tap send.
+
+### Direction 2: Capture flows (Share Sheet + App Intent)
+
+Capture is the path for getting content *into* the vault from outside Obelisk. **There is no in-chat capture button** — capture is a system-level entry point, not a chat affordance.
+
+Two complementary surfaces, both writing to `obelisk/inbox/` with `source: obelisk` frontmatter and a timestamp, both with **no model invocation and no chat history** (pure write operations):
+
+1. **Share Sheet extension.** The user taps Share in any app, picks Obelisk, and the shared payload (URL, selected text, image) becomes a new markdown note in the inbox. A small confirmation toast appears in the source app.
+2. **`CaptureToObeliskIntent` App Intent.** Takes a `text: String` parameter and writes the same way. Available to Shortcuts, Siri ("Capture to Obelisk: ..."), Spotlight, and as an alternate Action Button binding for users who prefer capture over chat.
+
+The user later opens Obelisk and asks "what's in my inbox?" to triage. Triage UX itself is just a normal chat interaction — no special inbox screen.
+
+### Direction 3: Obelisk triggers user Shortcuts
 
 Add a `RunShortcutTool` that takes a shortcut name and optional input. This is the workaround for the "Obelisk can't directly call other apps' intents" limitation. The user pre-builds Shortcuts for the things they want Obelisk to be able to do; Obelisk picks the right one and runs it.
 
@@ -507,7 +531,7 @@ Flow:
 
 Bonus tool: `ListShortcutsTool` that returns the user's installed shortcut names so the model knows what's available. (Note: there's no public API to enumerate installed shortcuts; the user maintains an opt-in list in Settings of shortcuts Obelisk is allowed to invoke.)
 
-**If this is too much work for v1, defer the entire `RunShortcutTool`.** Direction 1 (Obelisk as a Shortcuts target via App Intents) is the higher-value half — it covers the Action Button flow which is the headline feature of this phase.
+**If this is too much work for v1, defer the entire `RunShortcutTool`.** Directions 1 and 2 (Action Button + capture flows via App Intents and the Share Sheet) are the higher-value half — they cover the headline interactions of this phase.
 
 ### App Intent assistant schemas (worth doing)
 
@@ -525,10 +549,12 @@ Since Obelisk creates and queries notes, the `.journal` assistant schema is a st
 - **Intent must be in same target as `AppShortcutsProvider`.** Common gotcha when refactoring code into packages.
 - **The intent code can't easily share runtime state with the app.** Plan for the intent to launch the app or pass data via shared storage (App Group).
 - **Action Button binding is user-driven.** You can't bind it programmatically; you can only document how the user does it.
+- **Share Sheet extension runs in its own process.** It cannot reach into the main app's runtime; route writes through the same vault-access layer via an App Group container and security-scoped bookmarks shared from the main app.
+- **Action Button must land in a new conversation with dictation already live.** Resist the urge to "resume last chat" — that's how Action Button presses end up appending to existing threads.
 
 ### Deliverable
 
-User binds Action Button to Obelisk. Holds Action Button → Obelisk opens listening. Speaks query → answer. Separately: Obelisk can run a Shortcut the user has built ("post to Mastodon," "control HomeKit scene," etc.).
+User binds Action Button to Obelisk. Presses Action Button → Obelisk opens in a new chat with the mic already recording. Speaks → reviews transcription → taps send → answer. Separately: the Share Sheet and a `CaptureToObeliskIntent` can drop content into `obelisk/inbox/` without opening the app. Separately again: Obelisk can run a Shortcut the user has built ("post to Mastodon," "control HomeKit scene," etc.).
 
 ---
 
@@ -540,13 +566,19 @@ Something good enough to give to friends without embarrassment.
 
 ### Work items
 
-- **Model info row in Settings.** Informational only — shows "Apple Foundation Models (on-device)" and the model's availability state. No picker, no download, no switching. (A real model picker is deferred until a second `LLMRunner` exists.)
+- **Settings screen, per [ui-spec.md §3.4](./ui-spec.md).** Single scrollable list grouped into:
+  - **Vault** — path, change vault, indexing status, re-index now.
+  - **Model** — read-only "Apple Foundation Models (on-device)" with availability state. No picker, no download, no switching (a real picker is deferred until a second `LLMRunner` exists).
+  - **Tools** — web search toggle + search API key, authorized Shortcuts list.
+  - **Authorized folders** — folders Obelisk is allowed to write to (default: `obelisk/`); add via document picker.
+  - **Voice** — dictation on/off, Whisper model picker (`base.en` default).
+  - **About** — version, privacy, licenses.
 - **Memory pressure handling.** Respond to `didReceiveMemoryWarning` by tearing down the active `LanguageModelSession`. Re-create on next use.
-- **Onboarding flow.** First-launch experience: explain what Obelisk is, confirm Apple Intelligence is enabled (with deep-link to Settings if not), request permissions in context.
-- **Settings.** API keys for search, model selection, voice on/off, default response style.
-- **Error states.** Network failures, tool errors, model load failures — all need user-visible handling.
-- **Conversation management.** Rename, delete, export to markdown, search across conversations.
-- **App icon, launch screen, basic visual design.**
+- **Onboarding flow, per [ui-spec.md §3.5](./ui-spec.md).** Three swipeable screens: Welcome (with the "what it does NOT do" list), Vault picker (with iCloud download warning), Apple Intelligence availability check (deep-link to Settings if disabled, hard-block if device unsupported).
+- **Error states.** Network failures, tool errors, model load failures — all need user-visible handling via the status pill system and inline error rows from [ui-spec.md §4.8 / §5](./ui-spec.md).
+- **Conversation management.** Rename, delete, export to markdown, search across conversations (drawer per [ui-spec.md §3.2](./ui-spec.md)).
+- **Status pill component.** Implement the green/amber/red top-of-screen pill from [ui-spec.md §5](./ui-spec.md).
+- **App icon and launch screen.** Direction per [ui-spec.md §8](./ui-spec.md): a stylized geometric mark, *not* a literal obelisk illustration. Complementary to Obsidian's `◇` shape language — single recognizable geometric primitive, flat, monochrome with purple accent on a dark background, instantly readable at 60×60px. Explicit non-goals: realism, gradients, drop shadows, photographic textures, AI clichés (no robot / sparkles / chat bubble).
 - **TestFlight setup.** Apple Developer account, App Store Connect, internal testers group, build upload via Xcode.
 
 ### Pitfalls
