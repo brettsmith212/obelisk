@@ -261,22 +261,22 @@ Cancellation: tapping stop calls `runner.cancel()`, which propagates to `Languag
 
 Sequential — earlier steps unblock later ones.
 
-1. **Project skeleton.** Xcode project, iOS 26 deployment target, Foundation Models capability enabled, run on simulator and device.
-2. **Design system.** Implement [ui-spec.md §2](./ui-spec.md) tokens — colors, typography, spacing — as `Color` / `Font` extensions. Build a tiny preview gallery to verify dark/light.
-3. **Domain types.** `Conversation`, `Message`, `ToolCall`, etc., with Codable round-trip tests.
-4. **`Tool` protocol + `DateTimeTool`.** Simplest possible — no I/O.
-5. **`LLMRunner` protocol + neutral event types.** Define and document the seam.
-6. **`AppleFoundationRunner` (DateTime only).** Spin up a `LanguageModelSession`, register the date/time tool, return an `AsyncThrowingStream<LLMEvent>`. Validate that you can pressure-test the model into calling the tool ("what time is it?").
-7. **`AgentService`.** Bridges `LLMRunner` stream to `AgentEvent`s, dispatches tool calls through `ToolDispatcher`, feeds results back into the runner.
-8. **`ConversationManager` + `ConversationStore`.** JSON persistence, atomic writes, index file.
-9. **Chat shell — minimum viable.** `ChatView` with hardcoded test conversation rendering. Verify colors / typography / spacing match the spec.
-10. **Streaming wiring.** Send → stream tokens → render. Tool calls render inline. Final state persists.
-11. **Add `CalculatorTool` and `ScratchpadTool`.**
-12. **Edit / regenerate / stop** ([ui-spec.md §4.1–§4.3](./ui-spec.md)).
-13. **Drawer + multiple conversations + "+ New conversation"** ([ui-spec.md §3.2](./ui-spec.md)).
-14. **Empty state** ([ui-spec.md §3.3](./ui-spec.md), simplified).
-15. **Error handling.** Tool errors → amber inline row. Model errors / unavailability → red replacement with retry.
-16. **Device QA.** Run on a real iPhone 15 Pro / 16 Pro. Verify Apple Intelligence is on. Test multi-turn, tool use, persistence, cold launch, backgrounding.
+1. ✅ **Project skeleton.** Xcode project, iOS 26 deployment target, Foundation Models capability enabled, run on simulator and device.
+2. ✅ **Design system.** Implement [ui-spec.md §2](./ui-spec.md) tokens — colors, typography, spacing — as `Color` / `Font` extensions. Build a tiny preview gallery to verify dark/light.
+3. ✅ **Domain types.** `Conversation`, `Message`, `ToolCall`, etc., with Codable round-trip tests. *(Types in place; explicit round-trip tests deferred until a test target exists.)*
+4. ✅ **`Tool` protocol + `DateTimeTool`.** Simplest possible — no I/O.
+5. ✅ **`LLMRunner` protocol + neutral event types.** Define and document the seam.
+6. ✅ **`AppleFoundationRunner` (DateTime only).** Spin up a `LanguageModelSession`, register the date/time tool, return an `AsyncThrowingStream<LLMEvent>`. Validate that you can pressure-test the model into calling the tool ("what time is it?"). *(Validated on iOS 26.5 simulator — model invoked the tool and streamed a correct answer.)*
+7. ✅ **`AgentService`.** Bridges `LLMRunner` stream to `AgentEvent`s, dispatches tool calls through `ToolDispatcher`, feeds results back into the runner.
+8. ✅ **`ConversationManager` + `ConversationStore`.** JSON persistence, atomic writes, index file. *(500 ms debounced saves; empty conversations not persisted.)*
+9. ✅ **Chat shell — minimum viable.** `ChatView` with hardcoded test conversation rendering. Verify colors / typography / spacing match the spec.
+10. ✅ **Streaming wiring.** Send → stream tokens → render. Tool calls render inline. Final state persists. *(Verified on simulator with a real multi-turn FM conversation including tool calls.)*
+11. ⬜ **Add `CalculatorTool` and `ScratchpadTool`.** *(Requires the runner's adapter to grow beyond the empty-args shape — either per-tool `@Generable` adapters or a dynamic `GenerationSchema` + `GeneratedContent` adapter.)*
+12. ⬜ **Edit / regenerate / stop** ([ui-spec.md §4.1–§4.3](./ui-spec.md)). *(Stop is wired end-to-end via `streamingTask.cancel()`; edit and regenerate affordances not yet shown in the UI.)*
+13. ⬜ **Drawer + multiple conversations + "+ New conversation"** ([ui-spec.md §3.2](./ui-spec.md)). *(Hamburger button is a placeholder; `ConversationManager.summaries` and `selectConversation` are ready.)*
+14. ⬜ **Empty state** ([ui-spec.md §3.3](./ui-spec.md), simplified). *(First cut implemented — wordmark + suggestions; no stats line per spec.)*
+15. ⬜ **Error handling.** Tool errors → amber inline row. Model errors / unavailability → red replacement with retry. *(First cut: model errors render red inline; `AgentError.humanize` translates common FM raw errors. "Try again" button and amber tool-call row state still to wire.)*
+16. ⬜ **Device QA.** Run on a real iPhone 15 Pro / 16 Pro. Verify Apple Intelligence is on. Test multi-turn, tool use, persistence, cold launch, backgrounding.
 
 ---
 
