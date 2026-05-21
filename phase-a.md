@@ -271,12 +271,14 @@ Sequential — earlier steps unblock later ones.
 8. ✅ **`ConversationManager` + `ConversationStore`.** JSON persistence, atomic writes, index file. *(500 ms debounced saves; empty conversations not persisted.)*
 9. ✅ **Chat shell — minimum viable.** `ChatView` with hardcoded test conversation rendering. Verify colors / typography / spacing match the spec.
 10. ✅ **Streaming wiring.** Send → stream tokens → render. Tool calls render inline. Final state persists. *(Verified on simulator with a real multi-turn FM conversation including tool calls.)*
-11. ⬜ **Add `CalculatorTool` and `ScratchpadTool`.** *(Requires the runner's adapter to grow beyond the empty-args shape — either per-tool `@Generable` adapters or a dynamic `GenerationSchema` + `GeneratedContent` adapter.)*
-12. ⬜ **Edit / regenerate / stop** ([ui-spec.md §4.1–§4.3](./ui-spec.md)). *(Stop is wired end-to-end via `streamingTask.cancel()`; edit and regenerate affordances not yet shown in the UI.)*
-13. ⬜ **Drawer + multiple conversations + "+ New conversation"** ([ui-spec.md §3.2](./ui-spec.md)). *(Hamburger button is a placeholder; `ConversationManager.summaries` and `selectConversation` are ready.)*
-14. ⬜ **Empty state** ([ui-spec.md §3.3](./ui-spec.md), simplified). *(First cut implemented — wordmark + suggestions; no stats line per spec.)*
-15. ⬜ **Error handling.** Tool errors → amber inline row. Model errors / unavailability → red replacement with retry. *(First cut: model errors render red inline; `AgentError.humanize` translates common FM raw errors. "Try again" button and amber tool-call row state still to wire.)*
-16. ⬜ **Device QA.** Run on a real iPhone 15 Pro / 16 Pro. Verify Apple Intelligence is on. Test multi-turn, tool use, persistence, cold launch, backgrounding.
+11. ✅ **Add `CalculatorTool` and `ScratchpadTool`.** *(Runner now uses a `GeneratedContent`-based `JSONArgsToolAdapter` that translates Obelisk's `JSONSchema` into a `DynamicGenerationSchema`; all three Phase A tools share the same adapter. Validated in the iOS 26.5 simulator: `🧮 calculator ✓ → "The result of 14 * 23 is 322."` and `📄 scratchpad ✓ → ideas.md` written to `Documents/scratchpad/`.)*
+12. ✅ **Edit / regenerate / stop** ([ui-spec.md §4.1–§4.3](./ui-spec.md)). *(All three wired — edit inline-replaces a user message and truncates everything after, regenerate replaces the last assistant turn in place, stop cancels the streaming task and marks the turn `… stopped`.)*
+13. ✅ **Drawer + multiple conversations + "+ New conversation"** ([ui-spec.md §3.2](./ui-spec.md)). *(Slide-over drawer with scrim, conversations grouped Today / Yesterday / Previous 7 days / Previous 30 days / Older, active row highlighted in accent purple, "+ New conversation" creates an empty thread and closes the drawer.)*
+14. ✅ **Empty state** ([ui-spec.md §3.3](./ui-spec.md), simplified). *(Wordmark + "Start a conversation." + three static suggestions that populate — not auto-send — the input field; no stats line, per the simplified Phase A scope.)*
+15. ✅ **Error handling.** Tool errors → amber inline row. Model errors / unavailability → red replacement with retry. *(Tool-call row now renders the amber error message below the header glyph; failed assistant turns get a red "Try again" button that re-runs through the same regenerate path. `AgentError.humanize` continues to translate common FM raw errors into actionable copy.)*
+16. ⬜ **Device QA.** Run on a real iPhone 15 Pro / 16 Pro. Verify Apple Intelligence is on. Test multi-turn, tool use, persistence, cold launch, backgrounding. *(Pending — requires hardware. Simulator validation covers everything else.)*
+
+Multi-turn history note: `AppleFoundationRunner` now rebuilds a `Transcript` per call from the prior `[user, assistant]` pairs, so follow-up questions like "now multiply that by 5" correctly carry forward the previous numeric answer.
 
 ---
 

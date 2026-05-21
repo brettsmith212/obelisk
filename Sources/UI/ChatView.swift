@@ -1,21 +1,54 @@
 import SwiftUI
 
-/// The Phase A chat shell. Top bar, message list (or empty state), input
-/// row with send/stop toggle. Drawer, edit/regenerate, and full error
-/// surfacing land in later steps; this view is the minimum needed for an
-/// end-to-end send → stream → persist loop.
+/// The Phase A chat shell. Implements (per phase-a.md §4):
+///   - top bar with hamburger → drawer (ui-spec §3.2)
+///   - empty state (ui-spec §3.3, simplified — no vault stats)
+///   - message list with inline tool-call rows (§4.5)
+///   - user-message edit (§4.1) and last-assistant regenerate (§4.2)
+///   - stop while streaming (§4.3)
+///   - inline error tiers (§4.8): amber on failed tool-call rows,
+///     red replacing the assistant turn with a "Try again" button.
 struct ChatView: View {
     let env: AppEnvironment
 
     // Local UI state — not persisted.
     @State private var inputText: String = ""
     @State private var streamingTask: Task<Void, Never>?
+    @State private var drawerOpen: Bool = false
+    @State private var editingMessageID: UUID? = nil
+    @State private var editingText: String = ""
 
     private var manager: ConversationManager { env.manager }
     private var agent: AgentService { env.agent }
     private var isStreaming: Bool { streamingTask != nil }
 
     var body: some View {
+        ZStack(alignment: .leading) {
+            mainContent
+
+            // Drawer scrim + panel slide-over (ui-spec §3.2).
+            if drawerOpen {
+                Color.black.opacity(0.35)
+                    .ignoresSafeArea()
+                    .transition(.opacity)
+                    .onTapGesture { closeDrawer() }
+            }
+
+            DrawerView(
+                summaries: manager.summaries,
+                activeID: manager.activeConversation?.id,
+                onNew: { newConversation() },
+                onSelect: { id in selectConversation(id: id) }
+            )
+            .frame(width: 280)
+            .offset(x: drawerOpen ? 0 : -320)
+            .animation(.easeInOut(duration: 0.22), value: drawerOpen)
+        }
+    }
+
+    // MARK: - Main column
+
+    private var mainContent: some View {
         ZStack {
             Color.obBackground.ignoresSafeArea()
 
@@ -24,7 +57,17 @@ struct ChatView: View {
                 Divider().background(Color.obBorder)
 
                 if let conversation = manager.activeConversation, !conversation.messages.isEmpty {
-                    MessageListView(conversation: conversation)
+                    MessageListView(
+                        conversation: conversation,
+                        isStreaming: isStreaming,
+                        editingMessageID: editingMessageID,
+                        editingText: $editingText,
+                        onBeginEdit: beginEdit,
+                        onConfirmEdit: confirmEdit,
+                        onCancelEdit: cancelEdit,
+                        onRegenerate: regenerate,
+                        onRetry: regenerate
+                    )
                 } else {
                     EmptyStateView(onPickSuggestion: { inputText = $0 })
                 }
@@ -40,11 +83,9 @@ struct ChatView: View {
         }
     }
 
-    // MARK: - Top bar
-
     private var topBar: some View {
         HStack {
-            Button(action: { /* drawer — step 13 */ }) {
+            Button(action: { drawerOpen.toggle() }) {
                 Image(systemName: "line.3.horizontal")
                     .foregroundStyle(Color.obTextPrimary)
             }
@@ -53,10 +94,9 @@ struct ChatView: View {
                 .font(.obTitle)
                 .foregroundStyle(Color.obTextPrimary)
             Spacer()
-            Button(action: { /* overflow — later */ }) {
-                Image(systemName: "ellipsis")
-                    .foregroundStyle(Color.obTextPrimary)
-            }
+            // Overflow menu — rename/delete/export land in Phase F.
+            Image(systemName: "ellipsis")
+                .foregroundStyle(Color.obTextPrimary.opacity(0.25))
         }
         .padding(.horizontal, ObSpacing.screenH)
         .padding(.vertical, 12)
@@ -73,9 +113,6 @@ struct ChatView: View {
             manager.newConversation()
         }
 
-        // Append the user turn + a streaming assistant placeholder so the
-        // UI updates instantly and the placeholder is in place for token
-        // events to mutate.
         manager.updateActive { conversation in
             conversation.messages.append(Message(role: .user, content: prompt))
             if conversation.messages.filter({ $0.role == .user }).count == 1 {
@@ -83,7 +120,88 @@ struct ChatView: View {
             }
             conversation.messages.append(Message(role: .assistant, content: "", status: .streaming))
         }
+        runAgent()
+    }
 
+    private func stop() {
+        streamingTask?.cancel()
+        agent.cancel()
+    }
+
+    // MARK: - Drawer actions
+
+    private func newConversation() {
+        if isStreaming { stop() }
+        editingMessageID = nil
+        manager.newConversation()
+        closeDrawer()
+    }
+
+    private func selectConversation(id: UUID) {
+        if isStreaming { stop() }
+        editingMessageID = nil
+        manager.selectConversation(id: id)
+        closeDrawer()
+    }
+
+    private func closeDrawer() {
+        withAnimation(.easeInOut(duration: 0.22)) { drawerOpen = false }
+    }
+
+    // MARK: - Edit / regenerate / retry
+
+    private func beginEdit(message: Message) {
+        guard !isStreaming, message.role == .user else { return }
+        editingMessageID = message.id
+        editingText = message.content
+    }
+
+    private func cancelEdit() {
+        editingMessageID = nil
+        editingText = ""
+    }
+
+    /// Per ui-spec §4.1 — replace the user message, drop every subsequent
+    /// turn, then re-run from that point.
+    private func confirmEdit() {
+        let trimmed = editingText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let id = editingMessageID, !trimmed.isEmpty, !isStreaming else { return }
+
+        manager.updateActive { conversation in
+            guard let idx = conversation.messages.firstIndex(where: { $0.id == id }),
+                  conversation.messages[idx].role == .user
+            else { return }
+            conversation.messages[idx].content = trimmed
+            conversation.messages.removeSubrange((idx + 1)..<conversation.messages.count)
+            conversation.messages.append(Message(role: .assistant, content: "", status: .streaming))
+        }
+        editingMessageID = nil
+        editingText = ""
+        runAgent()
+    }
+
+    /// Per ui-spec §4.2 — replace the most recent assistant turn in place.
+    /// Doubles as the "Try again" handler from §4.8 tier 2.
+    private func regenerate() {
+        guard !isStreaming else { return }
+        manager.updateActive { conversation in
+            guard let lastIdx = conversation.messages.lastIndex(where: { $0.role == .assistant })
+            else { return }
+            // If the previous run errored before any tokens, just reset.
+            conversation.messages[lastIdx] = Message(
+                id: conversation.messages[lastIdx].id,
+                role: .assistant,
+                content: "",
+                toolCalls: [],
+                status: .streaming
+            )
+        }
+        runAgent()
+    }
+
+    // MARK: - Streaming wiring
+
+    private func runAgent() {
         guard let snapshot = manager.activeConversation else { return }
 
         streamingTask = Task { @MainActor in
@@ -91,9 +209,6 @@ struct ChatView: View {
             for await event in stream {
                 handle(event)
             }
-            // Loop exit reasons: .finalDone, .error, or task cancellation.
-            // For cancellation we mark `.stopped`; otherwise leave the
-            // status set by `.finalDone` / `.error`.
             if Task.isCancelled {
                 manager.updateActive { conversation in
                     guard var last = conversation.messages.last, last.role == .assistant else { return }
@@ -106,13 +221,6 @@ struct ChatView: View {
             streamingTask = nil
         }
     }
-
-    private func stop() {
-        streamingTask?.cancel()
-        agent.cancel()
-    }
-
-    // MARK: - Stream event reducer
 
     private func handle(_ event: AgentEvent) {
         switch event {
@@ -144,8 +252,6 @@ struct ChatView: View {
         }
     }
 
-    /// Apply a mutation to the most recent assistant message. Used by the
-    /// event reducer above so each case stays one line.
     private func mutateLastAssistant(_ mutation: (inout Message) -> Void) {
         manager.updateActive { conversation in
             guard var last = conversation.messages.last, last.role == .assistant else { return }
@@ -155,18 +261,150 @@ struct ChatView: View {
     }
 }
 
+// MARK: - Drawer (ui-spec §3.2)
+
+private struct DrawerView: View {
+    let summaries: [ConversationSummary]
+    let activeID: UUID?
+    let onNew: () -> Void
+    let onSelect: (UUID) -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Button(action: onNew) {
+                HStack(spacing: 10) {
+                    Image(systemName: "plus")
+                    Text("New conversation")
+                    Spacer()
+                }
+                .font(.obBody)
+                .foregroundStyle(Color.obTextPrimary)
+                .padding(.horizontal, ObSpacing.cardH)
+                .padding(.vertical, 12)
+            }
+            .buttonStyle(.plain)
+            Divider().background(Color.obBorder)
+
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    ForEach(Self.group(summaries), id: \.0) { (heading, rows) in
+                        Text(heading)
+                            .font(.obSection)
+                            .foregroundStyle(Color.obTextSecondary)
+                            .padding(.horizontal, ObSpacing.cardH)
+                            .padding(.top, 16)
+                            .padding(.bottom, 4)
+                        ForEach(rows) { summary in
+                            Button(action: { onSelect(summary.id) }) {
+                                HStack(spacing: 8) {
+                                    Text(summary.title.isEmpty ? "New conversation" : summary.title)
+                                        .font(.obBody)
+                                        .foregroundStyle(Color.obTextPrimary)
+                                        .lineLimit(1)
+                                    Spacer()
+                                }
+                                .padding(.horizontal, ObSpacing.cardH)
+                                .padding(.vertical, 10)
+                                .background(
+                                    activeID == summary.id
+                                        ? Color.obAccent.opacity(0.15)
+                                        : Color.clear
+                                )
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    if summaries.isEmpty {
+                        Text("No conversations yet.")
+                            .font(.obMeta)
+                            .foregroundStyle(Color.obTextTertiary)
+                            .padding(.horizontal, ObSpacing.cardH)
+                            .padding(.vertical, 16)
+                    }
+                }
+            }
+            Spacer(minLength: 0)
+        }
+        .frame(maxHeight: .infinity)
+        .background(Color.obSurfaceElevated)
+        .overlay(
+            Rectangle()
+                .fill(Color.obBorder)
+                .frame(width: ObStroke.hairline),
+            alignment: .trailing
+        )
+    }
+
+    /// Today / Yesterday / Previous 7 days / Previous 30 days / Older.
+    private static func group(_ summaries: [ConversationSummary])
+        -> [(String, [ConversationSummary])] {
+        let cal = Calendar.current
+        let now = Date.now
+        var today: [ConversationSummary] = []
+        var yesterday: [ConversationSummary] = []
+        var prev7: [ConversationSummary] = []
+        var prev30: [ConversationSummary] = []
+        var older: [ConversationSummary] = []
+
+        for s in summaries {
+            if cal.isDateInToday(s.updatedAt) {
+                today.append(s)
+            } else if cal.isDateInYesterday(s.updatedAt) {
+                yesterday.append(s)
+            } else if let diff = cal.dateComponents([.day], from: s.updatedAt, to: now).day {
+                if diff <= 7 { prev7.append(s) }
+                else if diff <= 30 { prev30.append(s) }
+                else { older.append(s) }
+            } else {
+                older.append(s)
+            }
+        }
+
+        var groups: [(String, [ConversationSummary])] = []
+        if !today.isEmpty     { groups.append(("Today", today)) }
+        if !yesterday.isEmpty { groups.append(("Yesterday", yesterday)) }
+        if !prev7.isEmpty     { groups.append(("Previous 7 days", prev7)) }
+        if !prev30.isEmpty    { groups.append(("Previous 30 days", prev30)) }
+        if !older.isEmpty     { groups.append(("Older", older)) }
+        return groups
+    }
+}
+
 // MARK: - Message list
 
 private struct MessageListView: View {
     let conversation: Conversation
+    let isStreaming: Bool
+    let editingMessageID: UUID?
+    @Binding var editingText: String
+    let onBeginEdit: (Message) -> Void
+    let onConfirmEdit: () -> Void
+    let onCancelEdit: () -> Void
+    let onRegenerate: () -> Void
+    let onRetry: () -> Void
+
+    private var lastAssistantID: UUID? {
+        conversation.messages.last(where: { $0.role == .assistant })?.id
+    }
 
     var body: some View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: ObSpacing.messageGap) {
                     ForEach(conversation.messages) { message in
-                        MessageRow(message: message)
-                            .id(message.id)
+                        MessageRow(
+                            message: message,
+                            isLastAssistant: message.id == lastAssistantID,
+                            isStreaming: isStreaming,
+                            isEditing: message.id == editingMessageID,
+                            editingText: $editingText,
+                            onBeginEdit: { onBeginEdit(message) },
+                            onConfirmEdit: onConfirmEdit,
+                            onCancelEdit: onCancelEdit,
+                            onRegenerate: onRegenerate,
+                            onRetry: onRetry
+                        )
+                        .id(message.id)
                     }
                 }
                 .padding(.horizontal, ObSpacing.screenH)
@@ -188,37 +426,123 @@ private struct MessageListView: View {
 
 private struct MessageRow: View {
     let message: Message
+    let isLastAssistant: Bool
+    let isStreaming: Bool
+    let isEditing: Bool
+    @Binding var editingText: String
+    let onBeginEdit: () -> Void
+    let onConfirmEdit: () -> Void
+    let onCancelEdit: () -> Void
+    let onRegenerate: () -> Void
+    let onRetry: () -> Void
 
     var body: some View {
         switch message.role {
-        case .user:    UserBubble(message: message)
-        case .assistant: AssistantTurn(message: message)
-        case .tool, .system: EmptyView()
+        case .user:
+            UserBubble(
+                message: message,
+                isStreaming: isStreaming,
+                isEditing: isEditing,
+                editingText: $editingText,
+                onBeginEdit: onBeginEdit,
+                onConfirmEdit: onConfirmEdit,
+                onCancelEdit: onCancelEdit
+            )
+        case .assistant:
+            AssistantTurn(
+                message: message,
+                isLastAssistant: isLastAssistant,
+                isStreaming: isStreaming,
+                onRegenerate: onRegenerate,
+                onRetry: onRetry
+            )
+        case .tool, .system:
+            EmptyView()
         }
     }
 }
 
 private struct UserBubble: View {
     let message: Message
+    let isStreaming: Bool
+    let isEditing: Bool
+    @Binding var editingText: String
+    let onBeginEdit: () -> Void
+    let onConfirmEdit: () -> Void
+    let onCancelEdit: () -> Void
 
     var body: some View {
-        HStack {
-            Spacer(minLength: 40)
-            Text(message.content)
+        VStack(alignment: .trailing, spacing: 4) {
+            HStack {
+                Spacer(minLength: 40)
+                if isEditing {
+                    editor
+                } else {
+                    Text(message.content)
+                        .font(.obBody)
+                        .foregroundStyle(Color.obTextPrimary)
+                        .padding(.horizontal, ObSpacing.cardH)
+                        .padding(.vertical, 10)
+                        .background(
+                            RoundedRectangle(cornerRadius: ObRadius.card, style: .continuous)
+                                .fill(Color.obAccent.opacity(0.15))
+                        )
+                        .textSelection(.enabled)
+                }
+            }
+
+            if !isEditing && !isStreaming {
+                Button(action: onBeginEdit) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "pencil")
+                        Text("edit")
+                    }
+                    .font(.obMeta)
+                    .foregroundStyle(Color.obTextTertiary)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+    }
+
+    private var editor: some View {
+        VStack(alignment: .trailing, spacing: 8) {
+            TextField("", text: $editingText, axis: .vertical)
                 .font(.obBody)
                 .foregroundStyle(Color.obTextPrimary)
+                .lineLimit(1...10)
                 .padding(.horizontal, ObSpacing.cardH)
                 .padding(.vertical, 10)
                 .background(
                     RoundedRectangle(cornerRadius: ObRadius.card, style: .continuous)
                         .fill(Color.obAccent.opacity(0.15))
                 )
+                .overlay(
+                    RoundedRectangle(cornerRadius: ObRadius.card, style: .continuous)
+                        .stroke(Color.obAccent.opacity(0.4), lineWidth: ObStroke.hairline)
+                )
+
+            HStack(spacing: 12) {
+                Button("Cancel", action: onCancelEdit)
+                    .font(.obMeta)
+                    .foregroundStyle(Color.obTextSecondary)
+                Button(action: onConfirmEdit) {
+                    Text("Save & send")
+                        .font(.obMeta.weight(.semibold))
+                        .foregroundStyle(Color.obAccent)
+                }
+                .disabled(editingText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
         }
     }
 }
 
 private struct AssistantTurn: View {
     let message: Message
+    let isLastAssistant: Bool
+    let isStreaming: Bool
+    let onRegenerate: () -> Void
+    let onRetry: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -228,7 +552,7 @@ private struct AssistantTurn: View {
 
             if message.content.isEmpty && message.status == .streaming {
                 TypingIndicator()
-            } else {
+            } else if !message.content.isEmpty {
                 Text(message.content)
                     .font(.obBody)
                     .foregroundStyle(message.status == .errored ? Color.obStatusRed : Color.obTextPrimary)
@@ -241,6 +565,37 @@ private struct AssistantTurn: View {
                 Text("… stopped")
                     .font(.obMeta)
                     .foregroundStyle(Color.obTextTertiary)
+            }
+
+            // Affordances under the last assistant turn (ui-spec §4.2, §4.8).
+            if isLastAssistant && !isStreaming {
+                if message.status == .errored {
+                    Button(action: onRetry) {
+                        HStack(spacing: 6) {
+                            Image(systemName: "arrow.clockwise")
+                            Text("Try again")
+                        }
+                        .font(.obMeta.weight(.semibold))
+                        .foregroundStyle(Color.obStatusRed)
+                        .padding(.horizontal, ObSpacing.cardH)
+                        .padding(.vertical, 6)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: ObRadius.card, style: .continuous)
+                                .stroke(Color.obStatusRed.opacity(0.6), lineWidth: ObStroke.hairline)
+                        )
+                    }
+                    .buttonStyle(.plain)
+                } else if message.status == .complete || message.status == .stopped {
+                    Button(action: onRegenerate) {
+                        HStack(spacing: 4) {
+                            Image(systemName: "arrow.clockwise")
+                            Text("regenerate")
+                        }
+                        .font(.obMeta)
+                        .foregroundStyle(Color.obTextTertiary)
+                    }
+                    .buttonStyle(.plain)
+                }
             }
         }
     }
@@ -267,7 +622,7 @@ private struct ToolCallRow: View {
         }
     }
 
-    private var color: Color {
+    private var headerColor: Color {
         if let result = call.result, result.error != nil {
             return Color.obStatusAmber
         }
@@ -275,11 +630,20 @@ private struct ToolCallRow: View {
     }
 
     var body: some View {
-        HStack(spacing: 6) {
-            Text("\(glyph)  \(call.name)  \(trailing)")
-                .font(.obMeta)
-                .foregroundStyle(color)
-            Spacer()
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 6) {
+                Text("\(glyph)  \(call.name)  \(trailing)")
+                    .font(.obMeta)
+                    .foregroundStyle(headerColor)
+                Spacer()
+            }
+            // Amber inline error message (ui-spec §4.8 tier 1).
+            if let result = call.result, let err = result.error {
+                Text(err)
+                    .font(.obMeta)
+                    .foregroundStyle(Color.obStatusAmber)
+                    .padding(.leading, 22)
+            }
         }
     }
 }
@@ -309,8 +673,8 @@ private struct EmptyStateView: View {
 
     private let suggestions = [
         "What time is it?",
-        "Tell me a haiku about Obsidian.",
-        "What can you do?"
+        "Calculate 14 * 23 for me.",
+        "Save a note called 'ideas' that says 'try the local model first'."
     ]
 
     var body: some View {

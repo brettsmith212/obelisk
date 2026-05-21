@@ -28,9 +28,9 @@ final class AppEnvironment {
         self.manager = manager ?? ConversationManager()
     }
 
-    /// Phase A toolset: DateTime only (step 6). Calculator and Scratchpad
-    /// land in step 11 once the runner gains a non-empty-args adapter.
+    /// Phase A toolset (phase-a.md §6): DateTime, Calculator, Scratchpad.
+    /// The runner's dynamic `JSONArgsToolAdapter` handles all three.
     nonisolated static var defaultTools: [any Tool] {
-        [DateTimeTool()]
+        [DateTimeTool(), CalculatorTool(), ScratchpadTool()]
     }
 }
