@@ -143,6 +143,8 @@ A throwaway todo app: add items, mark complete, persist with `@AppStorage` or `S
 
 ## Phase A: Text-only chat agent (4–6 weeks)
 
+> **Status: ✅ Complete** — see [phase-a.md](./phase-a.md) for the execution log. Three on-device tools (`datetime`, `calculator`, `scratchpad`) wire end-to-end through Foundation Models with multi-turn `Transcript` history; chat shell ships drawer, edit, regenerate, stop, and inline error tiers per [ui-spec.md](./ui-spec.md). Physical-device QA on iPhone 15 Pro / 16 Pro is the only open thread.
+
 This is the foundation. Everything else sits on it. Don't rush.
 
 ### Goal

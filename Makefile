@@ -11,7 +11,7 @@ DESTINATION := platform=iOS Simulator,name=$(SIM_NAME)
 DD          := build
 APP         := $(DD)/Build/Products/Debug-iphonesimulator/$(SCHEME).app
 
-.PHONY: all gen build run install launch boot clean test refresh-lsp lsp-config
+.PHONY: all gen build run install launch boot clean test refresh-lsp lsp-config seed-vault
 
 all: run
 
@@ -65,6 +65,32 @@ refresh-lsp:
 	  -derivedDataPath $(DD) \
 	  clean build \
 	  | xcode-build-server parse -av
+
+# Copy an Obsidian vault into the booted simulator's Obelisk app container so
+# Phase B's SampleVaultProvider can use it. The copy lives only in the sim's
+# private data directory — nothing enters the repo. Existing contents at
+# Documents/SampleVault/ are replaced.
+#
+# Usage:
+#   make seed-vault VAULT=/Users/you/Documents/MyVault
+#   make seed-vault VAULT=~/Obsidian/Personal
+seed-vault: install
+ifndef VAULT
+	$(error VAULT=/path/to/your/vault is required)
+endif
+	@SRC=$$(eval echo "$(VAULT)"); \
+	  if [ ! -d "$$SRC" ]; then echo "✘ VAULT not found: $$SRC"; exit 1; fi; \
+	  APP_CONTAINER=$$(xcrun simctl get_app_container booted com.brettsmith.Obelisk data 2>/dev/null) || \
+	    { echo "✘ Obelisk isn't installed in the booted sim. 'make install' first."; exit 1; }; \
+	  DEST="$$APP_CONTAINER/Documents/SampleVault"; \
+	  echo "▶ Seeding $$SRC → $$DEST"; \
+	  rm -rf "$$DEST"; \
+	  mkdir -p "$$DEST"; \
+	  rsync -a --exclude='.git' --exclude='.DS_Store' --exclude='.trash' \
+	        "$$SRC/" "$$DEST/"; \
+	  COUNT=$$(find "$$DEST" -name '*.md' | wc -l | tr -d ' '); \
+	  HAS_DOTOBSIDIAN=$$([ -d "$$DEST/.obsidian" ] && echo "yes" || echo "no"); \
+	  echo "✔ Seeded $$COUNT markdown notes (.obsidian present: $$HAS_DOTOBSIDIAN)."
 
 clean:
 	xcodebuild -project $(PROJECT) -scheme $(SCHEME) clean || true

@@ -15,6 +15,7 @@ The [Makefile](./Makefile) is the canonical driver. Do **not** invoke `xcodebuil
 | Boot the sim + install the app without launching | `make install` |
 | (Re)launch the already-installed app | `make launch` |
 | Run tests | `make test` |
+| Copy an Obsidian vault into the booted sim for Phase B dev | `make seed-vault VAULT=/path/to/your/vault` |
 | Fix "LSP not resolving symbols" / empty `.compile` | `make refresh-lsp` (then restart nvim) |
 | (Re)write `buildServer.json` for sourcekit-lsp | `make lsp-config` |
 | Nuke `build/`, `.compile`, `.bsp` | `make clean` |
