@@ -13,12 +13,33 @@ settings:
     MARKETING_VERSION: "0.1.0"
     CURRENT_PROJECT_VERSION: "1"
 
+# Phase B vault layer dependencies.
+# - Yams: YAML frontmatter parsing.
+# - GRDB.swift: SQLite vault index.
+# - swift-markdown: AST-aware markdown chunking (used now by parsers, by
+#   the embedding pipeline in Phase C).
+packages:
+  Yams:
+    url: https://github.com/jpsim/Yams
+    from: "6.2.1"
+  GRDB:
+    url: https://github.com/groue/GRDB.swift
+    from: "7.10.0"
+  Markdown:
+    url: https://github.com/apple/swift-markdown
+    branch: main
+
 targets:
   Obelisk:
     type: application
     platform: iOS
     sources:
       - path: Sources
+    dependencies:
+      - package: Yams
+      - package: GRDB
+      - package: Markdown
+        product: Markdown
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.brettsmith.Obelisk

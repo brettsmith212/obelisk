@@ -62,6 +62,7 @@ struct ChatView: View {
                         isStreaming: isStreaming,
                         editingMessageID: editingMessageID,
                         editingText: $editingText,
+                        vaultName: env.vaultAccess.activeVault?.displayName,
                         onBeginEdit: beginEdit,
                         onConfirmEdit: confirmEdit,
                         onCancelEdit: cancelEdit,
@@ -377,6 +378,7 @@ private struct MessageListView: View {
     let isStreaming: Bool
     let editingMessageID: UUID?
     @Binding var editingText: String
+    let vaultName: String?
     let onBeginEdit: (Message) -> Void
     let onConfirmEdit: () -> Void
     let onCancelEdit: () -> Void
@@ -398,6 +400,7 @@ private struct MessageListView: View {
                             isStreaming: isStreaming,
                             isEditing: message.id == editingMessageID,
                             editingText: $editingText,
+                            vaultName: vaultName,
                             onBeginEdit: { onBeginEdit(message) },
                             onConfirmEdit: onConfirmEdit,
                             onCancelEdit: onCancelEdit,
@@ -420,6 +423,29 @@ private struct MessageListView: View {
                     }
                 }
             }
+            // The Sources card appears only after a turn settles to
+            // `.complete` (see `AssistantTurn.showSourcesCard`). Since
+            // neither id nor content changes at that moment, scroll on
+            // status transitions so the card doesn't render below the
+            // input row's fold.
+            .onChange(of: conversation.messages.last?.status) { _, _ in
+                if let id = conversation.messages.last?.id {
+                    withAnimation(.easeInOut(duration: 0.18)) {
+                        proxy.scrollTo(id, anchor: .bottom)
+                    }
+                }
+            }
+            // Same idea for the streamed tool-call rows: a late-arriving
+            // tool result can grow the assistant turn after the last
+            // content delta. Re-anchor whenever the toolCalls array on
+            // the trailing message changes shape.
+            .onChange(of: conversation.messages.last?.toolCalls.count) { _, _ in
+                if let id = conversation.messages.last?.id {
+                    withAnimation(.linear(duration: 0.1)) {
+                        proxy.scrollTo(id, anchor: .bottom)
+                    }
+                }
+            }
         }
     }
 }
@@ -430,6 +456,7 @@ private struct MessageRow: View {
     let isStreaming: Bool
     let isEditing: Bool
     @Binding var editingText: String
+    let vaultName: String?
     let onBeginEdit: () -> Void
     let onConfirmEdit: () -> Void
     let onCancelEdit: () -> Void
@@ -453,6 +480,7 @@ private struct MessageRow: View {
                 message: message,
                 isLastAssistant: isLastAssistant,
                 isStreaming: isStreaming,
+                vaultName: vaultName,
                 onRegenerate: onRegenerate,
                 onRetry: onRetry
             )
@@ -541,8 +569,28 @@ private struct AssistantTurn: View {
     let message: Message
     let isLastAssistant: Bool
     let isStreaming: Bool
+    let vaultName: String?
     let onRegenerate: () -> Void
     let onRetry: () -> Void
+
+    /// Citations harvested from this turn's tool calls. Computed once
+    /// per body render; cheap because tool-call counts are tiny.
+    private var citations: [Citation] { SourcesCard.citations(in: message) }
+
+    /// Render the Sources card only after the turn settles. Streaming
+    /// the card in mid-flight makes it flicker as new tool calls land
+    /// and the model continues typing; we also don't want a Sources
+    /// card under a red `.errored` turn (the user's eye should go to
+    /// "Try again," not to mid-flight tool output).
+    private var showSourcesCard: Bool {
+        guard !citations.isEmpty,
+              let vaultName, !vaultName.isEmpty
+        else { return false }
+        switch message.status {
+        case .complete, .stopped: return true
+        case .streaming, .errored: return false
+        }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -553,12 +601,29 @@ private struct AssistantTurn: View {
             if message.content.isEmpty && message.status == .streaming {
                 TypingIndicator()
             } else if !message.content.isEmpty {
-                Text(message.content)
-                    .font(.obBody)
-                    .foregroundStyle(message.status == .errored ? Color.obStatusRed : Color.obTextPrimary)
-                    .obBodyLineSpacing()
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .textSelection(.enabled)
+                // While streaming OR after a clean settle: render
+                // wikilinks per ui-spec §4.7. The errored case stays as
+                // plain red text so the failure message reads as a
+                // single semantic unit rather than mixed-color tokens.
+                if message.status == .errored {
+                    Text(message.content)
+                        .font(.obBody)
+                        .foregroundStyle(Color.obStatusRed)
+                        .obBodyLineSpacing()
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled)
+                } else {
+                    WikilinkText(content: message.content, vaultName: vaultName)
+                        .font(.obBody)
+                        .foregroundStyle(Color.obTextPrimary)
+                        .obBodyLineSpacing()
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+
+            if showSourcesCard, let vaultName {
+                SourcesCard(citations: citations, vaultName: vaultName)
+                    .padding(.top, 4)
             }
 
             if message.status == .stopped {
@@ -671,10 +736,13 @@ private struct TypingIndicator: View {
 private struct EmptyStateView: View {
     let onPickSuggestion: (String) -> Void
 
+    // Suggestions exercise the Phase B vault toolset end-to-end:
+    // search → recent activity → backlinks. Tappable to populate the
+    // input; not auto-sent (matches the Phase A behavior).
     private let suggestions = [
-        "What time is it?",
-        "Calculate 14 * 23 for me.",
-        "Save a note called 'ideas' that says 'try the local model first'."
+        "Search my vault for productivity.",
+        "What notes did I touch in the last 3 days?",
+        "What links to [[Master Branch]]?"
     ]
 
     var body: some View {

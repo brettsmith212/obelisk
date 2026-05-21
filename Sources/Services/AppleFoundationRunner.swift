@@ -72,10 +72,11 @@ actor AppleFoundationRunner: LLMRunner {
     // MARK: - Core run loop
 
     private static let systemInstructions = """
-    You are Obelisk, a private on-device assistant. Be concise. \
-    When a tool can answer a factual question (current time, arithmetic, \
-    a scratchpad note, etc.), prefer calling the tool over guessing. \
-    After a tool returns, reply in plain prose — do not echo raw JSON.
+    You are Obelisk, a private on-device assistant grounded in the \
+    user's Obsidian vault. Be concise. Prefer calling a tool over \
+    guessing — search, read, and cite notes from the vault when the \
+    user asks about their own knowledge. After a tool returns, reply \
+    in plain prose; never echo raw JSON.
     """
 
     private func run(
@@ -327,9 +328,12 @@ private struct JSONArgsToolAdapter: FoundationModels.Tool {
         continuation.yield(.toolCallResult(id: id, result: result))
 
         if let err = result.error {
-            // Surface to FM so the model can react in its continuation; the
-            // user-visible row already shows amber via .toolCallResult above.
-            throw ToolError.executionFailed(err)
+            // Hand the failure to FM as a normal tool output so the model
+            // can apologize / suggest an alternative instead of crashing
+            // the whole generation. The user-visible amber row was already
+            // emitted via `.toolCallResult` above, so this stays the single
+            // source of error truth in the UI.
+            return Self.stringify(.object(["error": .string(err)]))
         }
         return Self.stringify(result.output)
     }
