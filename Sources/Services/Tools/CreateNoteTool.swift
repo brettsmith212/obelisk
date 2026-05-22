@@ -10,25 +10,31 @@ import CryptoKit
 /// - `title` (required): becomes the note's filename stem and a
 ///   `title:` frontmatter key.
 /// - `body` (required): markdown body.
-/// - `folder` (optional, default `"obelisk"`): vault subfolder to drop
-///   the file into. Refused if any segment of the resulting path is on
-///   the deny list (`.obsidian`, `.trash`, plus user-configured
+/// - `folder` (optional, default `""` — vault root): vault subfolder to
+///   drop the file into, matching where a manually-created Obsidian
+///   note would land. Refused if any segment of the resulting path is
+///   on the deny list (`.obsidian`, `.trash`, plus user-configured
 ///   entries).
 /// - `tags` (optional): array of tag names (no leading '#').
 struct CreateNoteTool: Tool {
     let name = "create_note"
     let description = """
-    Create a new note in the user's Obsidian vault. Defaults to the \
-    'obelisk/' folder but can write anywhere except the user's deny \
-    list. The note is stamped with 'source: obelisk' frontmatter and \
-    an optional list of tags. Use this for prompts like 'save a note \
-    about X'.
+    Create a new note in the user's Obsidian vault. Use this for prompts \
+    like 'save a note about X' or 'write a note titled Y'. \
+    DO NOT use this for daily notes or today's note — use read_daily_note \
+    with createIfMissing=true instead. \
+    IMPORTANT: If the user names a folder (e.g. 'in Archive', 'under \
+    Projects/', 'inside my Inbox folder'), you MUST pass that exact \
+    folder name in the 'folder' argument. Otherwise omit 'folder' — the \
+    note lands in the vault root, matching where a manually-created \
+    Obsidian note would go. \
+    The note is stamped with 'source: obelisk' frontmatter automatically.
     """
     let argumentsSchema: JSONSchema = .object(
         properties: [
             "title":  .string(description: "Note title — becomes both the filename and the 'title' frontmatter key."),
             "body":   .string(description: "Markdown body."),
-            "folder": .string(description: "Optional vault subfolder. Default 'obelisk'."),
+            "folder": .string(description: "Vault subfolder to write into. Pass the exact folder name the user mentioned (e.g. 'Archive', 'Projects/Active'). Omit when the user did not specify a folder — the note lands in the vault root."),
             "tags":   .array(items: .string(description: "Tag name without '#'."),
                              description: "Optional tags to write into frontmatter."),
         ],
@@ -59,7 +65,7 @@ struct CreateNoteTool: Tool {
         guard case .string(let body)? = props["body"] else {
             throw ToolError.invalidArguments("'body' is required.")
         }
-        let folder = (props["folder"]?.stringValue ?? "obelisk")
+        let folder = (props["folder"]?.stringValue ?? "")
             .trimmingCharacters(in: CharacterSet(charactersIn: "/ "))
         let tags: [String] = {
             guard case .array(let arr)? = props["tags"] else { return [] }

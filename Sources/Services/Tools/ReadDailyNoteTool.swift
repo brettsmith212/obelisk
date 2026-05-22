@@ -13,10 +13,15 @@ import CryptoKit
 struct ReadDailyNoteTool: Tool {
     let name = "read_daily_note"
     let description = """
-    Read the user's daily note for a given date (defaults to today). \
-    Uses the vault's daily-notes settings to figure out the filename \
-    and folder. Pass createIfMissing=true to create the note if it \
-    doesn't exist yet.
+    Read OR create the user's daily note for a given date (defaults to \
+    today). This is THE tool for any prompt mentioning 'daily note', \
+    'today's note', 'journal entry', 'my note for today', or asking \
+    about a specific date like '2026-05-22'. Uses the vault's \
+    daily-notes settings for the correct filename and folder. \
+    Pass createIfMissing=true when the user wants to create the daily \
+    note (e.g. 'create today's daily note', 'start my journal for \
+    today'). DO NOT use create_note for daily notes — this tool puts \
+    them in the right folder; create_note would put them in obelisk/.
     """
     let argumentsSchema: JSONSchema = .object(
         properties: [
