@@ -342,7 +342,7 @@ Sequential — earlier steps unblock later ones.
 13. ✅ **Citations UI.** [SourcesCard](./Sources/UI/SourcesCard.swift) lives at the bottom of any assistant turn whose tool calls returned `citations` (extracted via `SourcesCard.citations(in:)` — dedup'd by path, fail-safe over tools that don't emit them). Renders a "Sources" header above a bordered card; up to 3 rows visible by default, "+ N more" reveals the rest. Each row is a file glyph + title + 1–2-line snippet. Tap → `obsidian://open?vault=<displayName>&file=<path-without-md>` via SwiftUI's `@Environment(\.openURL)`. Card only renders after `message.status == .complete` so it doesn't flicker mid-stream; `MessageListView` now scrolls on `status` / `toolCalls.count` changes so a late-arriving card stays in view above the input row's fold. Validated on simulator: "Search my vault for productivity." → 8 citations, 3 visible + "+ 5 more", header + glyphs + truncated snippets all per [ui-spec.md §4.6](./ui-spec.md).
 14. ✅ **Wikilink rendering.** [WikilinkText](./Sources/UI/WikilinkText.swift) replaces the raw `Text(message.content)` in `AssistantTurn` for non-errored turns. Scans the prose with the same regex as `WikilinkParser`, builds an `AttributedString` where `[[` and `]]` render at ~40% accent opacity and the inner display name renders in accent purple semibold. All three segments carry the same `.link` attribute so the whole `[[…]]` is one tap target; SwiftUI's `@Environment(\.openURL)` dispatches the deep link. URL: `obsidian://open?vault=<displayName>&file=<Target[#Heading][#^block]>` — heading and block refs are appended per Obsidian's URL scheme; display labels (`[[Target|Label]]`) show `Label` while resolving to `Target`. Errored turns stay as plain red text so the failure reads as one semantic unit. Validated on simulator: "What links to [[Master Branch]]?" → model's response rendered `[[` `Master Branch` `]]` in spec'd accent-purple styling per [ui-spec.md §2.2 / §4.7](./ui-spec.md).
 15. ✅ **iCloud placeholder gate.** [VaultScanner](./Sources/Services/Vault/VaultScanner.swift) throws `ScanError.iCloudNotDownloaded` immediately after enumeration if `inventory.iCloudPlaceholders > 0` — copy: "Vault not fully downloaded from iCloud. Mark the folder as 'Keep on this iPhone' and try again." Enumerator no longer passes `.skipsHiddenFiles` (placeholder files are dot-prefixed like `.Foo.md.icloud`) and manually skips `.obsidian` / `.trash` / `.git` instead. `VaultIndexingService` surfaces the throw as `.failed(message)`, which [ChatView.activeStatusPill()](./Sources/UI/ChatView.swift) renders as a full-width red [StatusPill](./Sources/UI/StatusPill.swift) under the top bar; tap → `reindex(handle:)`. Validated on simulator: `touch .SomeNote.md.icloud` in the seeded vault → red pill on relaunch; `rm` the placeholder + tap the pill → pill clears, indexing returns to `.ready`. Force-download remains stretch.
-16. ⬜ **Device QA.** Real iPhone, real Obsidian vault (via iCloud or On My iPhone), all seven tools used in conversation, a note created in `obelisk/`, opened in Obsidian to confirm round-trip.
+16. ✅ **Device QA.** Validated on real iPhone with a real iCloud-stored Obsidian vault. Document picker → security-scoped bookmark → cold-launch restore all behave. All six read tools invoked end-to-end (`search_vault`, `read_note`, `list_notes_by_tag`, `get_backlinks`, `list_recent_notes`, `read_daily_note`); both write paths (`create_note`, `read_daily_note(createIfMissing: true)`) round-trip through Obsidian cleanly. Deny-list refusal confirmed end-to-end. Tool-routing pass surfaced two real issues that landed mid-QA: (a) the model was picking `create_note` for "create today's daily note" prompts → sharpened both tool descriptions so `read_daily_note` claims daily-note / today / journal / date-shaped requests and `create_note` explicitly disclaims them; (b) the `obelisk/` allowlist-vestige default folder was inconsistent with the denylist model → `CreateNoteTool.folder` now defaults to `""` (vault root), matching where a manually-created Obsidian note lands. Two gaps surfaced but intentionally not addressed in Phase B: no body-edit / append tool (the model improvises a duplicate note when asked to add content to an existing one — out of scope per the do-no-harm rules' "no structural body edits" stance), and Periodic Notes plugin config (`.obsidian/plugins/periodic-notes/data.json`) isn't read so vaults using it for daily notes fall back to core `daily-notes.json` defaults.
 
 ---
 
@@ -350,20 +350,20 @@ Sequential — earlier steps unblock later ones.
 
 Before declaring Phase B done, every item below must be demonstrably true:
 
-- [ ] On a fresh install with no vault, the app shows `VaultGateView` instead of the chat empty state.
-- [ ] Picking a vault via the document picker persists access across cold launches; re-launching does not re-prompt.
-- [ ] In Simulator with the sample vault, "Use sample vault" produces a working chat in under 5 seconds.
-- [ ] `SearchVaultTool` returns reasonable results for both exact and partial queries against the sample vault.
-- [ ] Asking "show me notes tagged X" lists the right notes from the sample corpus, including hierarchical matches.
-- [ ] "What links to [[A]]?" returns the expected backlinks; unresolved wikilinks don't crash the parser.
-- [ ] Asking "what's in my daily note today?" with no daily note present prompts the model to call `ReadDailyNoteTool(createIfMissing: true)`; the resulting note has `source: obelisk` frontmatter.
-- [ ] Asking the model to create a note inside a deny-listed folder (e.g. `.obsidian/`, `.trash/`, or any user-added entry from the Vault Settings sheet) fails the tool call with an amber inline error; no file is written under the denied path.
-- [ ] A note created by Obelisk is visible in the Files app inside the vault and opens cleanly in Obsidian (on device QA).
-- [ ] Wikilinks in assistant replies render in accent purple with low-opacity brackets and open Obsidian on tap.
-- [ ] Sources card renders under any cited assistant turn; tap → opens the note in Obsidian.
-- [ ] An iCloud-stored vault with at least one `.icloud` placeholder triggers the red "not fully downloaded" inline error and refuses to index until resolved.
-- [ ] Foregrounding the app after editing a vault note in Obsidian on Mac causes the next search to pick up the changes (incremental scan via SHA-256 diff).
-- [ ] No crashes after a 20-minute session that includes vault switching and at least one full re-index.
+- [x] On a fresh install with no vault, the app shows `VaultGateView` instead of the chat empty state.
+- [x] Picking a vault via the document picker persists access across cold launches; re-launching does not re-prompt.
+- [x] In Simulator with the sample vault, "Use sample vault" produces a working chat in under 5 seconds.
+- [x] `SearchVaultTool` returns reasonable results for both exact and partial queries against the sample vault. (Vague queries like "what notes do I have" under-perform — the LIKE search is the known weakness Phase C semantic supersedes.)
+- [x] Asking "show me notes tagged X" lists the right notes from the sample corpus, including hierarchical matches.
+- [x] "What links to [[A]]?" returns the expected backlinks; unresolved wikilinks don't crash the parser.
+- [x] Asking "what's in my daily note today?" with no daily note present prompts the model to call `ReadDailyNoteTool(createIfMissing: true)`; the resulting note has `source: obelisk` frontmatter.
+- [x] Asking the model to create a note inside a deny-listed folder (e.g. `.obsidian/`, `.trash/`, or any user-added entry from the Vault Settings sheet) fails the tool call with an amber inline error; no file is written under the denied path.
+- [x] A note created by Obelisk is visible in the Files app inside the vault and opens cleanly in Obsidian (on device QA).
+- [x] Wikilinks in assistant replies render in accent purple with low-opacity brackets and open Obsidian on tap.
+- [x] Sources card renders under any cited assistant turn; tap → opens the note in Obsidian.
+- [x] An iCloud-stored vault with at least one `.icloud` placeholder triggers the red "not fully downloaded" inline error and refuses to index until resolved.
+- [x] Foregrounding the app after editing a vault note in Obsidian on Mac causes the next search to pick up the changes (incremental scan via SHA-256 diff).
+- [x] No crashes after a 20-minute session that includes vault switching and at least one full re-index.
 
 ---
 
@@ -382,10 +382,14 @@ Before declaring Phase B done, every item below must be demonstrably true:
 
 ## 11. Hand-off to Phase C
 
+> **Phase C scope changed after Phase B device QA** — see [roadmap.md §"Phase C: Search that works"](./roadmap.md). The original "semantic search via embeddings" plan moved to deferred; the new Phase C is FTS5 + fuzzy fallback + frecency + `browse_vault`. Hand-off notes updated to reflect that.
+
 What Phase C will inherit and what it must *not* break:
 
-- The `VaultIndex` schema already reserves the `embeddings` table; Phase C only adds rows, no migration.
-- `MarkdownChunker` is built and tested in Phase B but unused by any tool yet — Phase C plugs it into the embedding pipeline.
-- The `SearchVaultTool` is the seam Phase C will *replace* (or duplicate as `SemanticSearchVaultTool`). The `citations`-shaped output stays identical so the Sources card UI doesn't change.
-- `VaultAccessService.withReadAccess` is the single mediator for file I/O — Phase C's embedding pass uses the same helper, no new coordination code.
-- The "do no harm" rules and `VaultWriter` are untouched by Phase C; embeddings are read-only over the vault.
+- The `notes` / `links` / `tags` schema from migration v1 is the source of truth Phase C extends. The FTS5 virtual table is an *external-content* mirror of `notes(title, body)` kept in sync via triggers, so the existing scanner upsert path stays unchanged.
+- The `embeddings` table reserved in migration v1 stays reserved and unused — Phase C v2 (this version) doesn't populate it. Kept on the schema so a future `semantic_search_vault` add-on doesn't need a migration.
+- `MarkdownChunker` is built in Phase B but unused — and stays unused through Phase C v2. Kept on the shelf for the same future embeddings work.
+- `SearchVaultTool` is the seam Phase C *upgrades in place*. Its `citations`-shaped output stays identical so the Sources card UI doesn't change. The new `BrowseVaultTool` reuses the same `Citation` shape via `VaultIndex.citation(forPath:)`.
+- `VaultAccessService.withReadAccess` is the single mediator for file I/O. Phase C is index-only — no new vault reads — so the helper stays untouched.
+- The "do no harm" rules and `VaultWriter` are untouched by Phase C; search and browse are read-only over the index.
+- Frecency tracking introduces a new `note_opens` table (Phase C migration v2). Writes happen from the UI layer (Sources card tap, wikilink tap) and from `read_note` / `read_daily_note` invocations. Independent of vault file I/O.

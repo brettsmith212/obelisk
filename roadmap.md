@@ -255,6 +255,8 @@ You can have a multi-turn conversation, the model uses all three tools when appr
 
 ## Phase B: Vault connection and Obsidian primitives (4–6 weeks)
 
+> **Status: ✅ Complete** — see [phase-b.md](./phase-b.md) for the execution log. Vault binding via document picker + security-scoped bookmark (with sample-vault `#if DEBUG` shortcut for the simulator), GRDB-backed `notes`/`links`/`tags` index with full + incremental SHA-256 scanning, all six read tools + `CreateNoteTool` wired through the existing `LLMRunner` seam, denylist-gated writes with `source: obelisk` enforcement and atomic temp+replace, Sources card + wikilink rendering in the chat shell, iCloud placeholder gate, Vault Settings sheet with deny-list editor. Device QA passed on iPhone with a real iCloud Obsidian vault — `create_note` defaults to vault root to match Obsidian's manual-create behavior. Known gaps deferred to later phases: no full-vault enumeration tool (Phase C semantic search supersedes), no body-edit / append tool, Periodic Notes plugin config not read (only core daily-notes.json).
+
 Before Obelisk can be useful, it needs to be able to safely read and reason about an Obsidian vault. This phase is the parsing and access layer.
 
 ### Goal
@@ -367,75 +369,91 @@ User picks their vault. Obelisk scans it, indexes notes/links/tags. The agent ca
 
 ---
 
-## Phase C: Semantic search via embeddings (3–4 weeks)
+## Phase C: Search that works — FTS5, fuzzy, frecency, browse (1–2 weeks)
 
-Phase B gave the agent vault access and text-based search. This phase adds the magic: ask a question, get back relevant notes that don't share keywords with the query.
+> **Scope change from the original roadmap.** The original Phase C was "semantic search via embeddings." Phase B device QA surfaced that the failure modes we actually hit are enumeration ("what notes do I have") and weak keyword matching (multi-word queries missing because of single-LIKE substring search) — not the semantic gap embeddings address. Independently, the agentic-coding industry converged on the opposite conclusion from what the original roadmap assumed: Claude Code abandoned RAG ("agentic search outperformed everything, by a lot" — Boris Cherny), Cline called semantic RAG "a mind virus for coding agents," Codex CLI just runs ripgrep, Aider uses Tree-sitter + PageRank with zero embeddings. The nuance: embeddings still win for knowledge bases where users *don't* share vocabulary with their corpus. For an Obsidian vault — where the user named every note, picks their own tags, and remembers their own wikilinks — the corpus is closer to "structured + perfectly searchable with lexical tools" than it is to "customer-support docs needing semantic matching." So this phase fixes search with the smallest tool that does the job, and embeddings move to deferred until dogfooding proves they're needed.
 
 ### Goal
 
-Obelisk can semantically search the vault. "What have I written about long-term thinking" returns notes that talk about patience, planning, deferred gratification — without those exact words appearing in the query.
+Search in Obelisk feels like good lexical search, not bad lexical search. "What notes do I have" returns a useful list. "productivity tips" finds notes containing either word with title hits ranked highest. "zetlekasten" still finds the note titled "Zettelkasten." Notes the user opens often surface first.
 
-### Embedding model
+### Architecture
 
-Start with `NLContextualEmbedding` from Apple's NaturalLanguage framework:
+```
+Existing (Phase B):
+  notes / links / tags          ← parsed metadata + body
+  embeddings                    ← reserved table, still unused
 
-- Built into iOS, no model download, no MLX plumbing
-- Reasonable quality for English
-- Fast on Apple Silicon
+New (Phase C):
+  notes_fts (FTS5 virtual)      ← title + body, BM25 ranked
+  note_opens                    ← (path, opened_at) for frecency
+```
 
-If quality feels insufficient later, swap to an MLX embedding model (`bge-small-en`, `nomic-embed-text` — both available in mlx-community). The interface stays the same; just the embedding function changes.
+All on built-in SQLite. No new packages. No model download. No vector storage. No incremental embedding sync. The `embeddings` table stays reserved but untouched.
 
-### Indexing flow
+### Pieces
 
-Extend the vault index schema with an `embeddings` table: `(note_path, chunk_index, chunk_start, chunk_end, embedding_blob, content_hash)`.
+**1. SQLite FTS5 virtual table.** Add `notes_fts(title, body)` as an external-content FTS5 table backed by the existing `notes` table. Triggers keep it in sync on insert/update/delete. Rewrite [VaultIndex.search](file:///Users/brettsmith/Documents/Developer/iOS/obelisk/Sources/Services/Vault/VaultIndex.swift) to use `bm25(notes_fts, 10.0, 1.0)` — title weighted 10× body — with `snippet(notes_fts, ...)` for the result snippet. Tag and folder filters stay as additional WHERE clauses.
 
-On vault connection (Phase B already detected it):
-1. List all notes; for each, check if content hash differs from indexed hash
-2. For changed/new notes, chunk via MarkdownChunker (from Phase B)
-3. Embed each chunk, store the result
-4. Show progress to the user — embedding a 5,000-note vault takes minutes, not seconds, on iPhone
+**2. Query translation with vocab correction.** Map the model's free-text `query` arg to FTS5 syntax: tokenize on whitespace, **rewrite each out-of-vocab token to its nearest in-vocab neighbor (edit distance ≤ 2, conservative length-aware budget)**, default to AND across the corrected tokens, fall back to OR if AND returns zero hits. Support quoted phrases (`"long term thinking"` → exact phrase, bypasses correction). Strip FTS5-significant punctuation to prevent syntax errors when the model sends raw prose. The vocabulary source is SQLite's own `notes_fts_v` auxiliary table — free with FTS5, refreshed when the scanner reports upserts. This is the typo-tolerance mechanism for multi-word queries: assume one of three tokens is misspelled and we want the *other two* to still match meaningfully, not get silently AND-zeroed.
 
-Incremental updates happen on app foreground: re-check hashes, re-embed only what changed.
+**3. Fuzzy title fallback.** Last-resort safety net: when FTS5 returns zero hits *even after vocab correction*, run a Levenshtein pass over note titles only (the corpus is small — brute force over 10k titles is sub-millisecond). Catches single-word title lookups like "zetlekasten" → "Zettelkasten" when the typo is too aggressive for vocab correction's budget, and the cold-start case where the vocab cache hasn't been built yet. Reserved for titles because fuzzy over full bodies is too slow and ranks worse than BM25 anyway. Score by edit-distance ratio; cap at top 8.
 
-### Retrieval
+**4. `BrowseVaultTool`.** Paginated enumeration. Args: `folder?` (vault subfolder), `tag?` (tag filter, no leading `#`), `includeChildTags` (default true, expands `project` to `project/work` etc.), `sortBy` (`title` | `modified`), `limit`, `offset`. Returns the page of notes with citations. Direct answer for "what notes do I have," "list everything in my Projects folder," "show me my #project notes," "what have I been working on lately," "the 20 most recent." This tool is intentionally broad — it absorbs the work of both `list_recent_notes` and `list_notes_by_tag`, which are removed in Phase C (see "Tools removed" below).
 
-At query time:
-1. Embed the query
-2. Compute cosine similarity against all chunks in SQLite (use sqlite-vec if you want; for v1 a plain `SELECT` + computation in Swift is fine until it isn't)
-3. Return top K (start with K=10)
-4. Optionally: re-rank top K by passing them through the LLM with a "which of these are actually relevant" prompt, take top 3-5
+**5. Frecency layer.** New `note_opens(path, opened_at)` table. Insert a row whenever the user opens a note via the Sources card tap, whenever `read_note` or `read_daily_note` runs, whenever a wikilink is tapped in an assistant turn. Compute a per-note frecency score with exponential decay (Mozilla-style: `Σ exp(-λ × days_since_open)`, 10-day half-life). Combine with BM25: `final = bm25_score * (1 + frecency_factor)`. Notes you've never opened still rank; notes you live in jump.
 
-### New tools
+**6. Sharpened tool description.** Single `search_vault` with a description that claims every "find / search / look up / show me notes about / what have I written about" prompt. `browse_vault` claims every "list / enumerate / what notes do I have / show me my vault" prompt. No naming overlap — the model picks the right one by intent shape, not by guessing between near-duplicate names.
 
-Replace the basic `SearchVaultTool` with a smarter one:
+### Tools after Phase C
 
-- **SemanticSearchVaultTool** — args: query, optional filters (tag, folder, date range). Returns top-K chunks with their parent note paths and snippets.
+| Tool | Status |
+|------|--------|
+| `search_vault` | Upgraded — FTS5 + BM25 + vocab correction + fuzzy fallback + frecency boost |
+| `browse_vault` | **New** — paginated enumeration with `folder` / `tag` / `includeChildTags` / `sortBy` / `limit` / `offset`; absorbs the two removals below |
+| `list_recent_notes` | **Removed** — covered by `browse_vault(sortBy="modified", limit=N)` |
+| `list_notes_by_tag` | **Removed** — covered by `browse_vault(tag=…, includeChildTags=…)` |
+| `read_note`, `get_backlinks`, `read_daily_note`, `create_note` | Unchanged from Phase B |
+| `datetime`, `calculator` | Unchanged from Phase A |
 
-Keep the existing text-based search as a separate tool. The agent can use whichever is appropriate (or both).
+Total: **8 tools** (Phase B had 8; Phase C adds 1 and removes 2). Comfortably under the 10-tool ceiling. Each tool now claims a distinct prompt shape, eliminating the near-duplicate enumeration ambiguity Phase B QA hit.
 
-### What this enables, product-wise
+### What this does NOT do
 
-This is the phase where Obelisk starts to feel intelligent. New flows that now work well:
-- "What ideas have I had related to this one" → semantic search finds adjacent thinking
-- "Summarize what I know about X" → retrieval pulls relevant notes, model synthesizes
-- "Find duplicate or near-duplicate notes" → cluster embeddings, surface clusters
+- **No "what have I written about long-term thinking" when no note contains 'long', 'term', or 'thinking'.** That's the case embeddings would handle. If dogfooding shows this is a real recurring miss, add embeddings later as a separate `semantic_search_vault` tool — the FTS5 + frecency infrastructure here doesn't fight that addition.
+- **No clustering / duplicate detection / "notes related to this one" surfacing.** Also embedding territory.
+- **No call-graph or wikilink-graph traversal in search.** Backlinks exist via `get_backlinks` but Phase C doesn't add PageRank-style ranking across the wikilink graph. Considered, deferred — not enough usage data to know if it pays off.
 
 ### Resources
 
-- `https://developer.apple.com/documentation/naturallanguage/nlcontextualembedding`
-- Smart Connections embedding strategy (study how they chunk and what models they use)
-- sqlite-vec extension: `https://github.com/asg017/sqlite-vec` — useful when the index grows large
+- SQLite FTS5 docs: `https://www.sqlite.org/fts5.html`
+- GRDB FTS5 helpers: `https://swiftpackageindex.com/groue/GRDB.swift/v7.10.0/documentation/grdb/fts5`
+- fff fuzzy file finder (architectural reference, not a port): `https://github.com/dmtrKovalenko/fff`
+- Boris Cherny on agentic search vs RAG: search "Cherny Claude Code RAG abandoned"
 
 ### Pitfalls
 
-- **Initial scan blocking the UI.** Run embedding work off the main thread, show progress, allow the user to keep using the chat interface (degraded — only text search until embeddings finish).
-- **Chunk boundaries cutting key information.** AST-aware chunking from `swift-markdown` helps — split at heading boundaries when possible.
-- **Embedding quality for niche domains.** Generic embedding models underperform on specialized vocabulary. If a user has a vault full of legal terms or biotech jargon, semantic search will feel mediocre. Defer until you see it as a real problem.
-- **Background eviction during long embedding runs.** iOS may kill the app. Track progress and resume from where you left off on next launch.
+- **FTS5 token-escaping bugs.** The model will send queries with `:`, `*`, `"`, parentheses. Sanitize before passing to MATCH or the query throws. Always wrap the whole user-string in `"..."` after escaping inner quotes; provides quoted-literal fallback for safety.
+- **External-content FTS5 sync drift.** The triggers must mirror every notes-table write. If the scanner upserts a note and the trigger fails silently, search and notes drift. Validate with `INSERT INTO notes_fts(notes_fts) VALUES('integrity-check')` periodically in DEBUG.
+- **Frecency feedback loops.** "Notes I open most" can ossify — favorites stay on top forever. Cap the frecency boost so a strong BM25 match can still beat a long-favored unrelated note.
+- **Fuzzy on body is too expensive.** Restrict the fallback to titles. Bodies stay FTS5-only.
+- **Browse pollution.** Default `browse_vault` limit must be small (e.g. 25) — a 5,000-note dump back to the model is useless and blows the context window.
 
 ### Deliverable
 
-User connects vault. Obelisk shows embedding progress. Once complete, the agent can answer questions that require semantic retrieval. "What have I written about X" works even when X never appears verbatim in the notes.
+On a real iPhone with a real Obsidian vault:
+- "What notes do I have" → `browse_vault` returns the first page sorted by recent.
+- "Search for productivity tips" → `search_vault` returns BM25-ranked hits with title matches first; sources card shows them.
+- "Find my zetlekasten note" (typo) → vocab correction (or fuzzy title fallback) finds "Zettelkasten."
+- "productiviy meeting notes" (typo in one of three tokens) → vocab correction rewrites `productiviy → productivity` and returns the same hits as the correctly-spelled query, instead of silently failing the AND pass.
+- A note you've opened five times in the past week ranks above an otherwise-equivalent note you've never opened.
+- Same physical-device QA pass as Phase B; new device-QA items cover the four bullets above.
+
+### Hand-off to whatever comes next
+
+- FTS5 schema is additive over Phase B; rolling back is one migration revert.
+- Frecency is independent infrastructure — voice (Phase D), capture (Phase E), and Settings (Phase F) can all read/write it without churn.
+- If embeddings come back as a future phase, the `embeddings` table is still reserved; `MarkdownChunker` is still ready to plug in. The fork point is "add `semantic_search_vault` as a sibling tool," not "rip out search_vault and rebuild."
 
 ---
 
@@ -597,6 +615,7 @@ A TestFlight build with onboarding, settings, error handling, and at least one f
 
 ## Deferred (out of v1)
 
+- **Semantic search via embeddings.** The original Phase C plan. Moved here based on (a) industry consensus that agentic lexical search outperforms RAG for code-shaped corpora and (b) Phase B device-QA evidence that the failure modes we hit were enumeration and weak keyword matching, not the semantic gap. Phase C v2 (FTS5 + fuzzy + frecency + browse) covers the observed needs without an embedding pipeline. If dogfooding surfaces real semantic misses ("what have I written about X" failing when X never appears verbatim), revisit: the `embeddings` table is reserved and `MarkdownChunker` is ready to plug in. When built, add as a sibling `semantic_search_vault` tool, not as a replacement.
 - **MLX backend (`MLXRunner`).** A second `LLMRunner` implementation using MLX-Swift for users who want a different/larger model, fewer content guardrails, or who are on devices without Apple Intelligence. The v1 protocol is designed so this can be added without touching `AgentService` or the tools — but the implementation itself is deferred. When built: clone `mlx-swift-examples`, study LLMEval/LLMChat, strip to the smallest model load + generate + tool-call loop.
 - **Model picker UI.** Settings screen to switch between `LLMRunner` backends, download/manage MLX models, etc. Only meaningful once a second runner exists.
 - **Fine-tuning.** LoRA via `mlx-lm` in Python, ship the adapter in Swift. Plausible v2 work, no need now.
