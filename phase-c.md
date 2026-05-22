@@ -383,19 +383,28 @@ No new screens, no new chat affordances. Empty-state suggestion chips updated to
 
 Sequential — earlier steps unblock later ones.
 
-1. ⬜ **Migration v2 + FTS5 backfill.** Add `notes_fts` virtual table + triggers + frecency table to [VaultIndexSchema.swift](./Sources/Persistence/VaultIndexSchema.swift). Validate by opening a fresh DB and a previously-Phase-B DB; both must end up with a fully-populated FTS5 index.
-2. ⬜ **`VocabCache`.** Read from the FTS5 `notes_fts_v` auxiliary table (`SELECT term FROM notes_fts_v WHERE col='*'`). Build once lazily, refresh after scanner upsert batches. Unit test: corpus changes → cache contains expected new tokens; deletes drop tokens that no longer appear anywhere.
-3. ⬜ **`QueryParser`.** Pure Swift, unit-testable. Convert raw text to FTS5 MATCH expression with the two-pass AND→OR fallback. **Includes the vocab-correction step.** Test corpus must cover: clean queries, single-token typos, multi-token queries with one typo, phrase queries (must bypass correction), short tokens (must skip correction), pathological FTS5-escaping inputs.
-4. ⬜ **`VaultIndex.search` rewrite.** Replace the LIKE-based implementation with FTS5 + BM25 + snippet. Keep the same `SearchHit` output shape so `SearchVaultTool` and the Sources card are untouched.
-5. ⬜ **`FuzzyTitleMatcher`.** Levenshtein over titles. Wire as the zero-hits fallback in `VaultIndex.search` (after vocab-corrected AND and OR passes both miss).
-6. ⬜ **`FrecencyTracker`.** Write side (INSERT on open) + read side (per-path score). Test the decay math against known timestamps.
-7. ⬜ **Wire frecency into `VaultIndex.search`.** Combine BM25 with the frecency boost; validate on the sample vault that opening a note 5× moves it up the ranking for the same query.
-8. ⬜ **Wire open events into UI.** `SourcesCard`, `WikilinkText`, `ReadNoteTool`, `ReadDailyNoteTool`.
-9. ⬜ **`BrowseVaultTool`.** New tool, paginated enumeration with `folder`, `tag`, `includeChildTags`, `sortBy`, `limit`, `offset` args. Add to `AppEnvironment.defaultTools`. Update empty-state suggestion chips to include enumeration ("What notes do I have?", "Show me my #project notes", "What have I been working on lately?").
-10. ⬜ **Remove `ListRecentNotesTool` and `ListNotesByTagTool`.** Delete the source files, remove the entries from `AppEnvironment.defaultTools(...)`, regenerate the Xcode project via `make gen`. Verify with `make build` that no other code references them. Update any DEBUG/test fixtures that constructed them.
-11. ⬜ **Sharpen tool descriptions.** `search_vault` and `browse_vault` distinguish clearly. `browse_vault` description must explicitly claim "recent notes," "what have I been working on," and "notes tagged X" prompt shapes that the deleted tools used to own.
-12. ⬜ **Cleanup task.** Background trim of `note_opens` older than 90 days on app launch.
-13. ⬜ **Device QA.** Real iPhone, real vault. All Phase-C deliverable bullets pass (including the two typo cases and the tag/recent prompts that now route to `browse_vault`).
+1. ✅ **Migration v2 + FTS5 backfill.** Added `notes_fts` external-content FTS5 table, sync triggers, `notes_fts_v` vocab table, and `note_opens` frecency table in [VaultIndexSchema.swift](./Sources/Persistence/VaultIndexSchema.swift).
+2. ✅ **`VocabCache`.** Implemented in [VocabCache.swift](./Sources/Services/Vault/VocabCache.swift); reads from `notes_fts_v`, refreshed on scanner upserts via `VaultIndex.markVocabDirty()`.
+3. ✅ **`QueryParser`.** Implemented in [QueryParser.swift](./Sources/Services/Vault/QueryParser.swift) with phrase extraction, FTS5 escaping, vocab-corrected AND, OR fallback. Unit-test coverage TBD.
+4. ✅ **`VaultIndex.search` rewrite.** Rewritten in [VaultIndex.swift](./Sources/Services/Vault/VaultIndex.swift) to use FTS5 BM25 with title weight 10.
+5. ✅ **`FuzzyTitleMatcher`.** Levenshtein-based fallback in [FuzzyTitleMatcher.swift](./Sources/Services/Vault/FuzzyTitleMatcher.swift); wired as the zero-hits fallback after AND and OR passes.
+6. ✅ **`FrecencyTracker`.** Implemented in [FrecencyTracker.swift](./Sources/Services/Vault/FrecencyTracker.swift) with write side, exponential decay read side, 90-day prune.
+7. ✅ **Wire frecency into `VaultIndex.search`.** BM25 × `(1 + boost)` combined ranking live. Visible-rank validation deferred to device QA.
+8. ✅ **Wire open events into UI.** `read_note` / `read_daily_note` tools, Sources card opens via `openURL` interceptor in [ChatView.swift](./Sources/UI/ChatView.swift), wikilink taps via the same interceptor.
+9. ✅ **`BrowseVaultTool`.** New tool with `folder`, `tag`, `includeChildTags`, `sortBy`, `limit`, `offset` args; registered in [AppEnvironment.swift](./Sources/App/AppEnvironment.swift); empty-state chips updated.
+10. ✅ **Remove `ListRecentNotesTool` and `ListNotesByTagTool`.** Both source files deleted; registry slimmed to 8 tools; `make build` clean.
+11. ✅ **Sharpen tool descriptions.** `search_vault` description tightened to claim search prompts; `browse_vault` description spells out enumeration prompt shapes (recent, tagged, folder, "what notes do I have").
+12. ✅ **Cleanup task.** Launch-time `FrecencyTracker.pruneOldOpens(...)` runs once per app launch from `AppEnvironment`.
+13. ⬜ **Device QA.** Real iPhone, real vault. All Phase-C deliverable bullets pass (including the two typo cases and the tag/recent prompts that now route to `browse_vault`). *Simulator QA done against a real vault; physical-device pass still pending.*
+
+#### Unplanned but completed during Phase C
+
+- **AFM 4096-token context defenses.** Real-world simulator QA against an Obsidian vault exposed that a single `browse_vault` page plus the model's bulleted reply, replayed across two turns, was overflowing Apple Foundation Models' 4096-token window — silently hanging the inference host with no thrown error. Added:
+  - **No-progress watchdog** in [AppleFoundationRunner.swift](./Sources/Services/AppleFoundationRunner.swift): if `streamResponse` produces no snapshot for 45s the runner emits an `inferenceStalled` error so the UI shows a red "Try again" row instead of staying on a stuck stop button.
+  - **Transcript trimming** (same file): keeps only the newest tail of history within a 6000-char budget before handing it to FM.
+  - **Per-turn dispatch guard** in [AgentService.swift](./Sources/Services/AgentService.swift): `browse_vault` is hard-capped to one call per assistant turn (the model could not be trusted to obey "call once" from prompt alone — it kept paginating and overflowing context).
+  - **Browse page hard cap of 10** in [BrowseVaultTool.swift](./Sources/Services/Tools/BrowseVaultTool.swift), with the tool description rewritten to embrace one-page-per-turn pagination ("ask 'more' for the next 10").
+  - **SwiftUI scroll-animation removal** in [ChatView.swift](./Sources/UI/ChatView.swift): per-token `withAnimation { scrollTo }` was triggering a `ViewLayoutEngine.sizeThatFits` layout cycle on long assistant messages, freezing the main thread. Bare `scrollTo` without animation is plenty for tail-following during streaming.
 
 ---
 
@@ -405,11 +414,11 @@ Before declaring Phase C done, every item below must be demonstrably true:
 
 - [ ] On a fresh install: vault binds, scan completes, search returns BM25-ranked hits for any keyword present in the vault.
 - [ ] On an upgrade from Phase B: existing DB migrates to v2, FTS5 table backfills, no data loss.
-- [ ] "What notes do I have" routes to `browse_vault` and returns the first page sorted by modified.
+- [x] "What notes do I have" routes to `browse_vault` and returns the first page sorted by modified. *(Verified in simulator QA against a real vault.)*
 - [ ] "List notes in my Projects folder" routes to `browse_vault` with `folder='Projects'` and returns only Projects/ notes.
 - [ ] "Show me my #project notes" routes to `browse_vault` with `tag='project'` (formerly the job of `list_notes_by_tag`); hierarchical children like `#project/work` are included by default.
 - [ ] "What have I been working on lately" routes to `browse_vault` with `sortBy='modified'` (formerly the job of `list_recent_notes`).
-- [ ] `list_recent_notes` and `list_notes_by_tag` are gone — `AppEnvironment.defaultTools(...)` returns exactly 8 tools.
+- [x] `list_recent_notes` and `list_notes_by_tag` are gone — `AppEnvironment.defaultTools(...)` returns exactly 8 tools.
 - [ ] Multi-word query like "productivity tips" returns notes where both words appear (AND first pass); if zero, returns notes where either word appears (OR fallback).
 - [ ] Title hits rank above body-only hits for the same query.
 - [ ] **Single-token typo**: "zetlekasten" (real note: "Zettelkasten") returns the right note. Vocab correction should rewrite it; if not, fuzzy fallback catches it. `SearchQuery.corrections` (logged in DEBUG) shows the rewrite when it happened.

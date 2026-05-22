@@ -15,6 +15,11 @@ final class AppEnvironment {
     let manager: ConversationManager
     let vaultAccess: VaultAccessService
     let vaultIndexing: VaultIndexingService
+    /// Exposed at app scope so chat UI taps (Sources card, wikilinks)
+    /// can record frecency open events without reaching through the
+    /// indexing service for the underlying `VaultIndex`. See
+    /// phase-c.md §8.
+    let frecency: FrecencyTracker
 
     init(
         runner: (any LLMRunner)? = nil,
@@ -28,7 +33,7 @@ final class AppEnvironment {
         let scanner = VaultScanner(index: index)
         let indexing = VaultIndexingService(index: index, scanner: scanner)
 
-        // Tools default to Phase B's vault toolset — `tools` is only
+        // Tools default to the Phase C vault toolset — `tools` is only
         // overridden by tests / previews.
         let resolvedTools: [any Tool] = tools ?? AppEnvironment.defaultTools(
             index: index,
@@ -42,6 +47,14 @@ final class AppEnvironment {
         self.manager = manager ?? ConversationManager()
         self.vaultAccess = access
         self.vaultIndexing = indexing
+        self.frecency = index.frecency
+
+        // One-shot launch maintenance: drop `note_opens` rows older
+        // than the lookback window so the table can't grow unbounded.
+        let frecency = index.frecency
+        Task.detached(priority: .background) {
+            frecency.pruneOldOpens()
+        }
     }
 
     /// Open (or create) the SQLite vault index in `Documents/vault-index.sqlite`.
@@ -66,12 +79,12 @@ final class AppEnvironment {
         }
     }
 
-    /// Phase B toolset (phase-b.md §4 + §7): the original `DateTimeTool`
-    /// and `CalculatorTool` survive from Phase A; `ScratchpadTool` is
-    /// removed per phase-b.md §1.6; the six vault read tools and the
-    /// single write tool (`CreateNoteTool`) take its place. Total: 9
-    /// tools — within the 6–10 ceiling phase-b.md §10 warns about for
-    /// the on-device 3B model.
+    /// Phase C toolset (phase-c.md §5.4): Phase A's `DateTimeTool` +
+    /// `CalculatorTool` and the Phase B vault tools, with two
+    /// enumeration tools (`list_recent_notes`, `list_notes_by_tag`)
+    /// collapsed into the new `BrowseVaultTool` and `SearchVaultTool`
+    /// upgraded to FTS5 + frecency. Total: 8 tools — comfortably under
+    /// the 10-tool ceiling.
     @MainActor
     static func defaultTools(index: VaultIndex, access: VaultAccessService) -> [any Tool] {
         // Snapshot the active vault's root URL on demand for tools that
@@ -91,10 +104,9 @@ final class AppEnvironment {
             DateTimeTool(),
             CalculatorTool(),
             SearchVaultTool(index: index),
+            BrowseVaultTool(index: index),
             ReadNoteTool(index: index),
-            ListNotesByTagTool(index: index),
             GetBacklinksTool(index: index),
-            ListRecentNotesTool(index: index),
             ReadDailyNoteTool(
                 index: index,
                 rootURLProvider: rootURLProvider,

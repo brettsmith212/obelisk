@@ -195,6 +195,14 @@ actor VaultScanner {
             try index.resolveOutboundLinks(using: resolverSnapshot.uniqueByBasename)
         }
 
+        // Phase C: a non-trivial upsert batch may have added or
+        // removed FTS5 vocab terms — invalidate the cache so the next
+        // query rebuilds it. Full scans always invalidate; incrementals
+        // only when something actually changed.
+        if mode == .full || parsed > 0 || deleted > 0 {
+            index.markVocabDirty()
+        }
+
         let duration = Date().timeIntervalSince(start)
         return Summary(
             mode: mode,

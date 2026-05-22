@@ -15,6 +15,18 @@ import GRDB
 final class VaultIndex {
     private let dbQueue: DatabaseQueue
 
+    /// Cached lazy vocab snapshot. Invalidated by `markVocabDirty()`
+    /// (called by the scanner after a non-trivial upsert batch) and
+    /// rebuilt on first query that needs it. Guarded by `vocabLock` —
+    /// we never mutate the snapshot itself, only swap the optional.
+    private var cachedVocab: VocabCache?
+    private let vocabLock = NSLock()
+
+    /// Frecency reader/writer over the same `DatabaseQueue`. Owned
+    /// here so tools and the scanner can share one instance and the
+    /// search path can call `rawScore` inside its own read txn.
+    let frecency: FrecencyTracker
+
     /// Persists at `Documents/vault-index.sqlite`. One DB per app install;
     /// switching vaults wipes and rebuilds (vault identity = the active
     /// security-scoped bookmark, not anything in this DB).
@@ -23,6 +35,7 @@ final class VaultIndex {
         config.foreignKeysEnabled = true
         self.dbQueue = try DatabaseQueue(path: databaseURL.path(), configuration: config)
         try VaultIndexSchema.makeMigrator().migrate(dbQueue)
+        self.frecency = FrecencyTracker(dbQueue: dbQueue)
     }
 
     // MARK: - Writes (used by VaultScanner)
@@ -108,7 +121,7 @@ final class VaultIndex {
     }
 
     /// Lightweight projection for list-style tool results
-    /// (`ListNotesByTagTool`, `ListRecentNotesTool`, `GetBacklinksTool`).
+    /// (`BrowseVaultTool`, `GetBacklinksTool`).
     struct NoteSummary: Equatable, Sendable {
         let path: String
         let title: String
@@ -135,43 +148,6 @@ final class VaultIndex {
         }
     }
 
-    /// Notes carrying a given tag. With `includeChildren = true`,
-    /// `project` also matches `project/obelisk`, `project/obelisk/phase-b`,
-    /// etc. (Obsidian's hierarchical-tag semantics.)
-    func notes(withTag tag: String, includeChildren: Bool, limit: Int) throws -> [NoteSummary] {
-        let normalized = tag.lowercased()
-            .trimmingCharacters(in: CharacterSet(charactersIn: "# /"))
-        guard !normalized.isEmpty else { return [] }
-
-        return try dbQueue.read { db in
-            let sql: String
-            let args: StatementArguments
-            if includeChildren {
-                sql = """
-                    SELECT DISTINCT n.path, n.title, n.modified_at
-                    FROM notes n
-                    JOIN tags t ON t.path = n.path
-                    WHERE t.tag = ? OR t.tag LIKE ?
-                    ORDER BY n.modified_at DESC
-                    LIMIT ?
-                    """
-                args = [normalized, normalized + "/%", limit]
-            } else {
-                sql = """
-                    SELECT DISTINCT n.path, n.title, n.modified_at
-                    FROM notes n
-                    JOIN tags t ON t.path = n.path
-                    WHERE t.tag = ?
-                    ORDER BY n.modified_at DESC
-                    LIMIT ?
-                    """
-                args = [normalized, limit]
-            }
-            let rows = try Row.fetchAll(db, sql: sql, arguments: args)
-            return rows.map(Self.noteSummary(from:))
-        }
-    }
-
     /// Backlinks to a given note (any other note whose `links.target_path`
     /// resolved to this path). Unresolved links are intentionally
     /// excluded — we don't know the user meant *this* note.
@@ -193,92 +169,436 @@ final class VaultIndex {
         }
     }
 
-    /// Notes modified within the trailing `days` window, newest first.
-    func recentNotes(within days: Int, limit: Int) throws -> [NoteSummary] {
-        let cutoff = Date().addingTimeInterval(-Double(days) * 86_400)
-        return try dbQueue.read { db in
-            let rows = try Row.fetchAll(
-                db,
-                sql: """
-                    SELECT path, title, modified_at
-                    FROM notes
-                    WHERE modified_at >= ?
-                    ORDER BY modified_at DESC
-                    LIMIT ?
-                    """,
-                arguments: [cutoff, limit]
-            )
-            return rows.map(Self.noteSummary(from:))
-        }
-    }
-
-    /// Naive case-insensitive LIKE search across title + body. Returns
-    /// hits with a snippet centered on the first body match (or the
-    /// first non-empty line when only the title matched). Phase C will
-    /// replace this with semantic search but keep the result shape.
+    /// FTS5-backed search across title + body with BM25 ranking, a
+    /// title-weight multiplier of 10, vocab-corrected typo handling,
+    /// a two-pass AND→OR strategy, and a fuzzy-title last-resort. All
+    /// surviving hits get a frecency boost layered on top.
     ///
-    /// Score is a coarse 0…1 heuristic: title hits weigh heaviest,
-    /// followed by raw match count in the body.
+    /// Behavior contract — phase-c.md §5.1:
+    /// 1. Build `SearchQuery` via `QueryParser` (vocab correction first).
+    /// 2. Try `(t1 AND t2 …)` MATCH expression.
+    /// 3. If zero rows, retry with `(t1 OR t2 …)`.
+    /// 4. If still zero, fall through to `FuzzyTitleMatcher` over
+    ///    titles only.
+    /// 5. For every hit, multiply BM25 score by `(1 + frecencyBoost)`
+    ///    where boost is capped at +150%.
+    ///
+    /// The `tag` and `folder` filters narrow the FTS5 candidate set
+    /// via SQL joins; they don't apply to the fuzzy stage (titles are
+    /// path-keyed but tag filtering would defeat the safety-net
+    /// purpose).
     func search(
         query: String,
         tag: String?,
         folder: String?,
         limit: Int
     ) throws -> [SearchHit] {
-        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return [] }
-        let needle = "%" + trimmed.replacingOccurrences(of: "%", with: "\\%") + "%"
+        let vocab = ensureVocab()
+        let parsed = QueryParser.parse(raw: query, vocab: vocab)
+        guard !parsed.isEmpty else { return [] }
+
+        #if DEBUG
+        if !parsed.corrections.isEmpty {
+            print("[VaultIndex.search] corrections: \(parsed.corrections)")
+        }
+        #endif
 
         return try dbQueue.read { db in
-            var sql = """
-                SELECT DISTINCT n.path, n.title, n.body, n.modified_at
-                FROM notes n
-                """
+            // First pass — AND. Models faithfully echo the user's
+            // tokens; vocab correction already normalized typos, so
+            // an AND with title-weighted BM25 is the right default.
+            var hits = try runFTS(
+                db,
+                query: parsed,
+                tag: tag,
+                folder: folder,
+                mode: .and,
+                limit: limit
+            )
+            if hits.isEmpty {
+                hits = try runFTS(
+                    db,
+                    query: parsed,
+                    tag: tag,
+                    folder: folder,
+                    mode: .or,
+                    limit: limit
+                )
+            }
+            if hits.isEmpty {
+                hits = try runFuzzyTitleFallback(
+                    db,
+                    parsed: parsed,
+                    tag: tag,
+                    folder: folder,
+                    limit: limit
+                )
+            }
+            return hits
+        }
+    }
+
+    // MARK: - Browse
+
+    /// How `browse(...)` orders the returned notes.
+    enum BrowseSort: String, Sendable {
+        case modified
+        case title
+    }
+
+    /// One page of `browse_vault` plus the total count needed to drive
+    /// pagination UX. See `BrowseVaultTool`.
+    struct BrowsePage: Equatable, Sendable {
+        let notes: [NoteSummary]
+        let totalCount: Int
+    }
+
+    /// Paginated enumeration over the notes table, optionally filtered
+    /// by folder prefix and/or tag. Powers `browse_vault` (phase-c.md
+    /// §5.2) and replaces the two removed Phase-B enumeration tools.
+    func browse(
+        folder: String?,
+        tag: String?,
+        includeChildTags: Bool,
+        sortBy: BrowseSort,
+        limit: Int,
+        offset: Int
+    ) throws -> BrowsePage {
+        let normalizedFolder = folder?
+            .trimmingCharacters(in: CharacterSet(charactersIn: "/ "))
+        let normalizedTag = tag?.lowercased()
+            .trimmingCharacters(in: CharacterSet(charactersIn: "# /"))
+
+        return try dbQueue.read { db in
             var args: [DatabaseValueConvertible] = []
-            var clauses: [String] = ["(LOWER(n.title) LIKE LOWER(?) OR LOWER(n.body) LIKE LOWER(?))"]
-            args.append(needle)
-            args.append(needle)
+            var joins = ""
+            var clauses: [String] = []
 
-            if let tag = tag?.lowercased()
-                .trimmingCharacters(in: CharacterSet(charactersIn: "# /")),
-               !tag.isEmpty {
-                sql += " JOIN tags t ON t.path = n.path "
-                clauses.append("(t.tag = ? OR t.tag LIKE ?)")
-                args.append(tag)
-                args.append(tag + "/%")
+            if let normalizedTag, !normalizedTag.isEmpty {
+                joins += " JOIN tags t ON t.path = n.path "
+                if includeChildTags {
+                    clauses.append("(t.tag = ? OR t.tag LIKE ?)")
+                    args.append(normalizedTag)
+                    args.append(normalizedTag + "/%")
+                } else {
+                    clauses.append("t.tag = ?")
+                    args.append(normalizedTag)
+                }
             }
-            if let folder = folder?
-                .trimmingCharacters(in: CharacterSet(charactersIn: "/ ")),
-               !folder.isEmpty {
+            if let normalizedFolder, !normalizedFolder.isEmpty {
                 clauses.append("n.path LIKE ?")
-                args.append(folder + "/%")
+                args.append(normalizedFolder + "/%")
             }
 
-            sql += " WHERE " + clauses.joined(separator: " AND ")
-            sql += " ORDER BY n.modified_at DESC LIMIT ?"
-            args.append(limit * 4) // overfetch; we trim after scoring
+            let whereClause = clauses.isEmpty
+                ? ""
+                : " WHERE " + clauses.joined(separator: " AND ")
 
+            let orderClause: String = {
+                switch sortBy {
+                case .modified: return " ORDER BY n.modified_at DESC "
+                case .title:    return " ORDER BY LOWER(n.title) ASC "
+                }
+            }()
+
+            // SELECT DISTINCT covers the tag-join multiplicity for the
+            // page; COUNT(DISTINCT) does the same for totals.
+            let pageSQL = """
+                SELECT DISTINCT n.path, n.title, n.modified_at
+                FROM notes n
+                \(joins)
+                \(whereClause)
+                \(orderClause)
+                LIMIT ? OFFSET ?
+                """
+            var pageArgs = args
+            pageArgs.append(limit)
+            pageArgs.append(offset)
             let rows = try Row.fetchAll(
+                db,
+                sql: pageSQL,
+                arguments: StatementArguments(pageArgs)
+            )
+            let notes = rows.map(Self.noteSummary(from:))
+
+            let countSQL = """
+                SELECT COUNT(*) FROM (
+                    SELECT DISTINCT n.path FROM notes n \(joins) \(whereClause)
+                )
+                """
+            let total = try Int.fetchOne(
+                db,
+                sql: countSQL,
+                arguments: StatementArguments(args)
+            ) ?? notes.count
+
+            return BrowsePage(notes: notes, totalCount: total)
+        }
+    }
+
+    // MARK: - Vocab cache
+
+    /// Snapshot of every term currently in `notes_fts`. Built on
+    /// demand; rebuilt only when `markVocabDirty()` is called.
+    func ensureVocab() -> VocabCache {
+        vocabLock.lock()
+        if let cached = cachedVocab {
+            vocabLock.unlock()
+            return cached
+        }
+        vocabLock.unlock()
+
+        let snapshot = (try? buildVocabSnapshot()) ?? VocabCache(terms: [])
+        vocabLock.lock()
+        cachedVocab = snapshot
+        vocabLock.unlock()
+        #if DEBUG
+        print("[VaultIndex] vocab cache built — \(snapshot.count) terms")
+        #endif
+        return snapshot
+    }
+
+    /// Drop the cached vocab snapshot. The scanner calls this after a
+    /// non-trivial upsert batch (`parsed + deleted > 0`); next query
+    /// rebuilds.
+    func markVocabDirty() {
+        vocabLock.lock()
+        cachedVocab = nil
+        vocabLock.unlock()
+    }
+
+    private func buildVocabSnapshot() throws -> VocabCache {
+        try dbQueue.read { db in
+            // `notes_fts_v` is the `fts5vocab` aux table declared in
+            // migration v2 (type 'col'). Distinct terms over all
+            // columns is exactly what the typo-correction step wants.
+            let terms = try String.fetchAll(
+                db,
+                sql: "SELECT DISTINCT term FROM notes_fts_v"
+            )
+            return VocabCache(terms: terms)
+        }
+    }
+
+    // MARK: - Search internals
+
+    private struct FTSRow {
+        let path: String
+        let title: String
+        let body: String
+        let modifiedAt: Date
+        let bm25: Double
+        let snippet: String
+    }
+
+    /// Run one FTS5 pass with the given AND/OR mode. Bails (returns
+    /// `[]`) when the parsed query can't produce a MATCH expression
+    /// — that's not a search miss, that's "nothing to search."
+    private func runFTS(
+        _ db: Database,
+        query: SearchQuery,
+        tag: String?,
+        folder: String?,
+        mode: QueryParser.MatchMode,
+        limit: Int
+    ) throws -> [SearchHit] {
+        guard let matchExpr = QueryParser.matchExpression(for: query, mode: mode) else {
+            return []
+        }
+
+        // BM25 weights: title × 10, body × 1. FTS5 returns *negative*
+        // BM25 (smaller is better); we flip it so callers can sort
+        // descending without thinking about it.
+        let normalizedTag = tag?.lowercased()
+            .trimmingCharacters(in: CharacterSet(charactersIn: "# /"))
+        let normalizedFolder = folder?
+            .trimmingCharacters(in: CharacterSet(charactersIn: "/ "))
+
+        var args: [DatabaseValueConvertible] = [matchExpr]
+        var joins = ""
+        var extraClauses: [String] = []
+
+        if let normalizedTag, !normalizedTag.isEmpty {
+            joins += " JOIN tags t ON t.path = n.path "
+            extraClauses.append("(t.tag = ? OR t.tag LIKE ?)")
+            args.append(normalizedTag)
+            args.append(normalizedTag + "/%")
+        }
+        if let normalizedFolder, !normalizedFolder.isEmpty {
+            extraClauses.append("n.path LIKE ?")
+            args.append(normalizedFolder + "/%")
+        }
+        // Overfetch so the frecency multiplier has room to reshuffle
+        // borderline-ranked candidates before we trim.
+        args.append(limit * 4)
+
+        let extraWhere = extraClauses.isEmpty
+            ? ""
+            : " AND " + extraClauses.joined(separator: " AND ")
+
+        let sql = """
+            SELECT DISTINCT
+                n.path, n.title, n.body, n.modified_at,
+                bm25(notes_fts, 100.0, 1.0) AS bm25_score,
+                snippet(notes_fts, 1, '', '', '…', 16) AS body_snippet
+            FROM notes_fts
+            JOIN notes n ON n.rowid = notes_fts.rowid
+            \(joins)
+            WHERE notes_fts MATCH ?
+            \(extraWhere)
+            ORDER BY bm25_score ASC
+            LIMIT ?
+            """
+
+        let rows: [FTSRow]
+        do {
+            rows = try Row.fetchAll(
                 db,
                 sql: sql,
                 arguments: StatementArguments(args)
-            )
-
-            let hits = rows.map { row -> SearchHit in
-                let path: String = row["path"] ?? ""
-                let title: String = row["title"] ?? ""
-                let body: String = row["body"] ?? ""
-                let modifiedAt: Date = row["modified_at"] ?? .distantPast
-                let snippet = Self.snippet(in: body, around: trimmed) ?? Self.firstNonEmptyLine(of: body)
-                let score = Self.score(query: trimmed, title: title, body: body)
-                return SearchHit(
-                    summary: NoteSummary(path: path, title: title, modifiedAt: modifiedAt),
-                    snippet: snippet,
-                    score: score
+            ).map { row in
+                FTSRow(
+                    path: row["path"] ?? "",
+                    title: row["title"] ?? "",
+                    body: row["body"] ?? "",
+                    modifiedAt: row["modified_at"] ?? .distantPast,
+                    bm25: row["bm25_score"] ?? 0,
+                    snippet: row["body_snippet"] ?? ""
                 )
             }
-            return hits.sorted { $0.score > $1.score }.prefix(limit).map { $0 }
+        } catch {
+            // FTS5 will throw on a malformed MATCH expression. Treat
+            // that as zero rows rather than crashing the whole tool
+            // call; the OR / fuzzy fallback may still recover.
+            #if DEBUG
+            print("[VaultIndex.runFTS] MATCH failed for '\(matchExpr)': \(error)")
+            #endif
+            return []
         }
+
+        var hits: [SearchHit] = []
+        hits.reserveCapacity(rows.count)
+        for row in rows {
+            let raw = try frecency.rawScore(db: db, path: row.path)
+            let multiplier = FrecencyTracker.bm25Multiplier(rawScore: raw)
+            // FTS5 returns negative BM25 (more negative = better
+            // match). Flip and add a small offset so multiplication
+            // by the frecency boost behaves intuitively (boosting a
+            // tied candidate moves it ahead instead of arithmetically
+            // backwards from negative numbers).
+            let baseScore = max(0.0001, -row.bm25)
+            let combined = baseScore * multiplier
+            let snippet = row.snippet.isEmpty
+                ? Self.firstNonEmptyLine(of: row.body)
+                : row.snippet
+            hits.append(
+                SearchHit(
+                    summary: NoteSummary(
+                        path: row.path,
+                        title: row.title,
+                        modifiedAt: row.modifiedAt
+                    ),
+                    snippet: snippet,
+                    score: combined
+                )
+            )
+        }
+        hits.sort { $0.score > $1.score }
+        return Array(hits.prefix(limit))
+    }
+
+    /// Title-only fuzzy fallback. Only runs after both AND and OR FTS
+    /// passes returned zero. Filters tag/folder client-side to keep
+    /// the safety-net behavior honest about which notes the caller
+    /// asked for.
+    private func runFuzzyTitleFallback(
+        _ db: Database,
+        parsed: SearchQuery,
+        tag: String?,
+        folder: String?,
+        limit: Int
+    ) throws -> [SearchHit] {
+        // Use the original raw query for fuzzy — vocab correction
+        // already failed, and the raw spelling is the best signal we
+        // have for the title-match metric.
+        let rawNeedle = parsed.raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !rawNeedle.isEmpty else { return [] }
+
+        let candidates = try Row.fetchAll(
+            db,
+            sql: "SELECT path, title, body, modified_at FROM notes"
+        )
+        let titles = candidates.map { row -> (path: String, title: String) in
+            (row["path"] ?? "", row["title"] ?? "")
+        }
+        let matches = FuzzyTitleMatcher.match(
+            query: rawNeedle,
+            titles: titles,
+            limit: limit
+        )
+        guard !matches.isEmpty else { return [] }
+
+        // Build the row lookup once so we can hydrate snippets without
+        // a per-match query.
+        var rowByPath: [String: Row] = [:]
+        for row in candidates {
+            if let p: String = row["path"] { rowByPath[p] = row }
+        }
+
+        var hits: [SearchHit] = []
+        hits.reserveCapacity(matches.count)
+        for match in matches {
+            guard let row = rowByPath[match.path] else { continue }
+            let body: String = row["body"] ?? ""
+            let modifiedAt: Date = row["modified_at"] ?? .distantPast
+
+            // Apply tag/folder filters client-side so the safety-net
+            // path doesn't bypass scope the user explicitly asked for.
+            if !matchesTag(row: row, db: db, tag: tag) { continue }
+            if let normalizedFolder = folder?
+                .trimmingCharacters(in: CharacterSet(charactersIn: "/ ")),
+               !normalizedFolder.isEmpty,
+               !match.path.hasPrefix(normalizedFolder + "/") {
+                continue
+            }
+
+            let raw = try frecency.rawScore(db: db, path: match.path)
+            let multiplier = FrecencyTracker.bm25Multiplier(rawScore: raw)
+            hits.append(
+                SearchHit(
+                    summary: NoteSummary(
+                        path: match.path,
+                        title: match.title,
+                        modifiedAt: modifiedAt
+                    ),
+                    snippet: Self.firstNonEmptyLine(of: body),
+                    score: match.score * multiplier
+                )
+            )
+        }
+        hits.sort { $0.score > $1.score }
+        return Array(hits.prefix(limit))
+    }
+
+    /// Tag filter for the fuzzy path. Returns true when no tag is
+    /// requested or the row carries the tag (with optional
+    /// hierarchical children, matching the search arg's semantics).
+    private func matchesTag(row: Row, db: Database, tag: String?) -> Bool {
+        guard let normalized = tag?.lowercased()
+            .trimmingCharacters(in: CharacterSet(charactersIn: "# /")),
+              !normalized.isEmpty,
+              let path: String = row["path"]
+        else { return true }
+        let hit = (try? Int.fetchOne(
+            db,
+            sql: """
+                SELECT 1 FROM tags
+                WHERE path = ? AND (tag = ? OR tag LIKE ?)
+                LIMIT 1
+                """,
+            arguments: [path, normalized, normalized + "/%"]
+        )) ?? nil
+        return hit != nil
     }
 
     /// Build a `Citation` from any indexed note path. Used by tools that
@@ -325,28 +645,13 @@ final class VaultIndex {
         return (try? JSONDecoder().decode([String: JSONValue].self, from: data)) ?? [:]
     }
 
-    // MARK: - Snippet + scoring
-
-    /// Best-effort hit-centered snippet (about 160 chars) trimmed to
-    /// the nearest word boundary on each side.
-    private static func snippet(in body: String, around query: String) -> String? {
-        guard !body.isEmpty, !query.isEmpty else { return nil }
-        let lower = body.lowercased()
-        guard let range = lower.range(of: query.lowercased()) else { return nil }
-        let radius = 80
-        let startIdx = body.index(range.lowerBound, offsetBy: -radius, limitedBy: body.startIndex) ?? body.startIndex
-        let endIdx = body.index(range.upperBound, offsetBy: radius, limitedBy: body.endIndex) ?? body.endIndex
-        var snippet = String(body[startIdx..<endIdx])
-            .replacingOccurrences(of: "\n", with: " ")
-            .trimmingCharacters(in: .whitespaces)
-        if startIdx != body.startIndex { snippet = "…" + snippet }
-        if endIdx != body.endIndex { snippet += "…" }
-        return snippet
-    }
+    // MARK: - Snippet
 
     /// First non-empty prose line, capped at 120 chars. Kept short on
     /// purpose: long snippets multiplied by 10+ citations blow past the
     /// on-device model's context budget when results are fed back in.
+    /// FTS5's `snippet()` does the heavy lifting for body matches; this
+    /// is the fallback when there's no in-body hit to center on.
     private static func firstNonEmptyLine(of body: String) -> String {
         for line in body.split(separator: "\n", omittingEmptySubsequences: true) {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
@@ -357,17 +662,6 @@ final class VaultIndex {
         return ""
     }
 
-    private static func score(query: String, title: String, body: String) -> Double {
-        let q = query.lowercased()
-        let titleLower = title.lowercased()
-        let bodyLower = body.lowercased()
-        let titleHits = titleLower.contains(q) ? 1 : 0
-        let bodyHits = bodyLower.components(separatedBy: q).count - 1
-        // Title match = 0.7, +0.05 per body hit, capped.
-        let raw = Double(titleHits) * 0.7 + min(Double(bodyHits) * 0.05, 0.3)
-        return min(raw, 1.0)
-    }
-
     /// Wipe every table. Used when the user picks a new vault — vault
     /// identity is the bookmark, not anything in this DB.
     func wipe() throws {
@@ -375,8 +669,12 @@ final class VaultIndex {
             try db.execute(sql: "DELETE FROM links")
             try db.execute(sql: "DELETE FROM tags")
             try db.execute(sql: "DELETE FROM embeddings")
+            try db.execute(sql: "DELETE FROM note_opens")
             try db.execute(sql: "DELETE FROM notes")
+            // FTS5 triggers cascade title/body deletes via the
+            // `notes` rows above, so notes_fts is empty by now.
         }
+        markVocabDirty()
     }
 
     // MARK: - Private query helpers

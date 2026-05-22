@@ -102,8 +102,17 @@ actor AppleFoundationRunner: LLMRunner {
             continuation.finish(throwing: AppleFoundationRunnerError.missingUserMessage)
             return
         }
-        let history = Array(messages.prefix(lastUserIndex))
+        let fullHistory = Array(messages.prefix(lastUserIndex))
         let userMessage = messages[lastUserIndex]
+
+        // Trim history to fit the AFM 4096-token window. Tool-heavy
+        // turns (e.g. browse_vault returning a long bulleted list) blow
+        // the budget within two exchanges. Walk backward and keep the
+        // newest turns whose combined character count stays under a
+        // conservative budget; the model loses long-ago context but
+        // keeps near-term coherence — much better than silently failing
+        // to generate.
+        let history = Self.trimHistory(fullHistory, maxChars: 6000)
 
         // 3. Build FoundationModels Tool adapters from descriptors.
         let adapters: [any FoundationModels.Tool]
@@ -136,24 +145,98 @@ actor AppleFoundationRunner: LLMRunner {
 
         // 5. Stream the response. Snapshots carry cumulative text; emit
         //    deltas so callers can keep appending per the `.token` contract.
+        //
+        //    A no-progress watchdog rides alongside the consumer: Apple's
+        //    on-device inference host can die mid-generation (most often
+        //    on context-window overflow during tool follow-up) without the
+        //    Swift surface ever throwing. Without the watchdog the UI sits
+        //    on the "stop" button forever. We treat ≥45s of stream silence
+        //    as a stall and surface it as `inferenceStalled` so the chat
+        //    can drop into the standard red error row.
         let genOptions = GenerationOptions(temperature: options.temperature)
-        do {
-            let stream = session.streamResponse(to: userMessage.content, options: genOptions)
-            var emitted = ""
-            for try await snapshot in stream {
-                let full = snapshot.content
-                guard full.count > emitted.count else { continue }
-                let delta = String(full[full.index(full.startIndex, offsetBy: emitted.count)...])
-                continuation.yield(.token(delta))
-                emitted = full
+        let stream = session.streamResponse(to: userMessage.content, options: genOptions)
+        let activity = ActivityClock()
+        await activity.tick()
+
+        // Race the consumer against a no-progress watchdog. We do NOT
+        // await consumer.value, because `session.streamResponse`'s
+        // for-await may not honor `Task.cancel()` when the inference
+        // host has already died — that would leave us awaiting a Task
+        // that never finishes. Instead, both tasks race to write the
+        // terminal event into a tiny actor; whoever loses is silently
+        // dropped (its work is harmless or background-leaked).
+        let result = StreamOutcome()
+
+        let consumer = Task<Void, Never> {
+            do {
+                var emitted = ""
+                for try await snapshot in stream {
+                    await activity.tick()
+                    let full = snapshot.content
+                    guard full.count > emitted.count else { continue }
+                    let delta = String(full[full.index(full.startIndex, offsetBy: emitted.count)...])
+                    continuation.yield(.token(delta))
+                    emitted = full
+                }
+                await result.finish(.done)
+            } catch is CancellationError {
+                await result.finish(.cancelled)
+            } catch {
+                await result.finish(.failed(error))
             }
-            continuation.yield(.done)
-        } catch is CancellationError {
-            // Stream cancelled by `cancel()` or task termination — finish
-            // silently so callers can mark the turn `.stopped`.
-        } catch {
-            continuation.finish(throwing: error)
         }
+
+        let watchdog = Task<Void, Never> {
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(5))
+                if Task.isCancelled { return }
+                if await activity.idleSeconds() > 45 {
+                    await result.finish(.stalled)
+                    return
+                }
+            }
+        }
+
+        switch await result.value() {
+        case .done:
+            watchdog.cancel()
+            continuation.yield(.done)
+        case .cancelled:
+            watchdog.cancel()
+            // Real user stop — finish silently so the UI marks the
+            // turn `.stopped` per its own policy.
+        case .failed(let error):
+            watchdog.cancel()
+            continuation.finish(throwing: error)
+        case .stalled:
+            // Watchdog won. The consumer task is likely still parked
+            // inside `for try await snapshot in stream`; cancel it
+            // best-effort and leave it to die in the background while
+            // we surface a clean error to the UI.
+            consumer.cancel()
+            continuation.finish(throwing: AppleFoundationRunnerError.inferenceStalled)
+        }
+    }
+
+    // MARK: - History trimming
+
+    /// Keep the newest tail of `history` whose total `content` character
+    /// count fits in `maxChars`. Always returns a contiguous suffix so
+    /// the model sees a coherent recent window. Empty assistant
+    /// placeholders are skipped from the budget since `buildTranscript`
+    /// drops them anyway.
+    private static func trimHistory(_ history: [Message], maxChars: Int) -> [Message] {
+        var kept: [Message] = []
+        var total = 0
+        for msg in history.reversed() {
+            let cost = msg.content.count
+            if total + cost > maxChars && !kept.isEmpty {
+                break
+            }
+            kept.append(msg)
+            total += cost
+        }
+        return kept.reversed()
     }
 
     // MARK: - Transcript builder
@@ -368,6 +451,7 @@ private struct JSONArgsToolAdapter: FoundationModels.Tool {
 enum AppleFoundationRunnerError: Error, LocalizedError {
     case unavailable(reason: String)
     case missingUserMessage
+    case inferenceStalled
 
     var errorDescription: String? {
         switch self {
@@ -375,6 +459,58 @@ enum AppleFoundationRunnerError: Error, LocalizedError {
             return reason
         case .missingUserMessage:
             return "No user message to send to the model."
+        case .inferenceStalled:
+            return "The on-device model stopped responding (this usually means the conversation exceeded its context window). Start a new chat or ask a shorter question."
+        }
+    }
+}
+
+/// Tracks the last moment we observed forward progress from
+/// `streamResponse`. Used by the no-progress watchdog above; kept as a
+/// tiny actor so the consumer and watchdog can share state safely.
+private actor ActivityClock {
+    private var last: Date = .distantPast
+
+    func tick() {
+        last = Date()
+    }
+
+    func idleSeconds() -> TimeInterval {
+        Date().timeIntervalSince(last)
+    }
+}
+
+/// First-finisher box for the consumer/watchdog race. Only the first
+/// `finish(_:)` wins; later writes are dropped. `value()` suspends until
+/// the first finisher lands. Used to translate "stream completed", "real
+/// cancellation", "thrown error", and "watchdog stall" into a single
+/// terminal event the run loop can switch on without awaiting the
+/// (potentially hung) consumer task.
+private actor StreamOutcome {
+    enum Outcome: Sendable {
+        case done
+        case cancelled
+        case failed(Error)
+        case stalled
+    }
+
+    private var outcome: Outcome?
+    private var waiters: [CheckedContinuation<Outcome, Never>] = []
+
+    func finish(_ outcome: Outcome) {
+        guard self.outcome == nil else { return }
+        self.outcome = outcome
+        let pending = waiters
+        waiters.removeAll()
+        for waiter in pending {
+            waiter.resume(returning: outcome)
+        }
+    }
+
+    func value() async -> Outcome {
+        if let outcome { return outcome }
+        return await withCheckedContinuation { cont in
+            waiters.append(cont)
         }
     }
 }

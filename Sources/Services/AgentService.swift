@@ -89,8 +89,35 @@ struct AgentService: Sendable {
             let dispatcher = self.dispatcher
 
             let task = Task {
+                // Per-turn guard. Two protections against context
+                // overflow on the AFM 4096-token window:
+                //   1. `singleCall`: some tools (notably
+                //      `browse_vault`) must not be called more than
+                //      once in the same turn — two pages of results
+                //      blow the window.
+                //   2. `maxTotalCalls`: cap total tool invocations
+                //      per turn at 2. One was too restrictive — the
+                //      model frequently re-runs search_vault in a
+                //      follow-up turn ("what does it say?") and then
+                //      needs read_note. Two calls accommodates that.
+                //      Tool outputs are kept compact (browse: 10
+                //      rows w/o snippets; search: trimmed snippets;
+                //      read_note: small preview by default) so the
+                //      two outputs still fit the 4096-token window.
+                let turnGuard = TurnGuard(singleCall: ["browse_vault"], maxTotalCalls: 2)
                 let dispatch: @Sendable (UUID, String, JSONValue) async -> ToolResult = { id, name, args in
-                    await dispatcher.dispatch(id: id, name: name, arguments: args)
+                    switch await turnGuard.shouldBlock(name) {
+                    case .allow:
+                        return await dispatcher.dispatch(id: id, name: name, arguments: args)
+                    case .duplicate:
+                        return .failure(
+                            "\(name) was already called this turn. Do NOT call it again. Reply to the user with the data you already have. If the user wants the next page, they will ask in their next message and you can call \(name) again then with offset=nextOffset."
+                        )
+                    case .overBudget:
+                        return .failure(
+                            "You may only call ONE tool per user turn. Reply to the user NOW with the data you already have from the previous tool call; do not call any more tools this turn. If the user wants you to do something with the result (e.g. read a found note), they will ask in their next message."
+                        )
+                    }
                 }
 
                 let stream = runner.generate(
@@ -140,5 +167,40 @@ struct AgentService: Sendable {
     /// stream consumer, but explicit when the UI's stop button is tapped.
     func cancel() {
         runner.cancel()
+    }
+}
+
+/// Per-turn dispatch guard. Tracks which tools have already been
+/// invoked within a single assistant turn. Lives only for the
+/// duration of one `AgentService.run(...)` call.
+private actor TurnGuard {
+    enum Decision {
+        case allow
+        case duplicate      // tool in `singleCall` invoked a second time
+        case overBudget     // would exceed `maxTotalCalls`
+    }
+
+    private var called: Set<String> = []
+    private var totalCalls: Int = 0
+    private let singleCall: Set<String>
+    private let maxTotalCalls: Int
+
+    init(singleCall: Set<String>, maxTotalCalls: Int) {
+        self.singleCall = singleCall
+        self.maxTotalCalls = maxTotalCalls
+    }
+
+    /// Returns the dispatcher's decision for this call. On `.allow`
+    /// the call is recorded so subsequent calls see the updated state.
+    func shouldBlock(_ name: String) -> Decision {
+        if singleCall.contains(name), called.contains(name) {
+            return .duplicate
+        }
+        if totalCalls >= maxTotalCalls {
+            return .overBudget
+        }
+        called.insert(name)
+        totalCalls += 1
+        return .allow
     }
 }

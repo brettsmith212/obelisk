@@ -7,18 +7,26 @@ import Foundation
 struct ReadNoteTool: Tool {
     let name = "read_note"
     let description = """
-    Read a single note from the user's Obsidian vault by its \
-    vault-relative path (e.g. 'Projects/Obelisk.md'). Returns the note's \
-    frontmatter and body. Long notes come back chunked — call again with \
-    'chunkIndex' to read the next chunk.
+    Read a single note from the vault by its vault-relative path \
+    (e.g. 'Projects/Obelisk.md'). Returns frontmatter + a body \
+    PREVIEW (first ~1500 chars) by default. Set `full: true` only \
+    when the user explicitly asks for the full body. For very long \
+    notes use `chunkIndex` to page.
     """
     let argumentsSchema: JSONSchema = .object(
         properties: [
             "path":       .string(description: "Vault-relative path to the note."),
-            "chunkIndex": .integer(description: "0-based chunk to read when the body was returned chunked."),
+            "full":       .boolean(description: "Set true to return the full body (default false — returns a ~1500-char preview)."),
+            "chunkIndex": .integer(description: "0-based chunk to read when the body was returned chunked (only relevant with full=true on very long notes)."),
         ],
         required: ["path"]
     )
+
+    /// Preview length when `full` is not set. ~1500 chars ≈ 375 tokens
+    /// — keeps the tool output small enough that the model can still
+    /// chain a search before this read without overflowing AFM's
+    /// 4096-token window.
+    private static let previewChars = 1_500
 
     /// ~6K-token threshold per phase-b.md §7. A crude 4-char-per-token
     /// approximation is fine for triggering the chunk path; the model
@@ -43,6 +51,15 @@ struct ReadNoteTool: Tool {
             throw ToolError.executionFailed("Note '\(path)' is not in the vault index.")
         }
 
+        // Frecency: record the open on a detached low-priority task so
+        // the tool call doesn't wait on the INSERT. See phase-c.md §8.
+        let frecency = index.frecency
+        let recordedPath = note.path
+        Task.detached(priority: .utility) {
+            frecency.recordOpen(path: recordedPath, source: .readNote)
+        }
+
+        let full = props["full"]?.boolValue ?? false
         let baseFields: [String: JSONValue] = [
             "path":        .string(note.path),
             "title":       .string(note.title),
@@ -54,6 +71,26 @@ struct ReadNoteTool: Tool {
             snippet: snippet(from: note.body),
             score: nil
         )
+
+        // Default preview path: keeps the tool output small so it fits
+        // alongside an earlier search_vault call in the same turn.
+        if !full {
+            let body = note.body
+            let isTruncated = body.count > Self.previewChars
+            let preview = isTruncated
+                ? String(body.prefix(Self.previewChars)) + "…"
+                : body
+            var out = baseFields
+            out["body"] = .string(preview)
+            out["isPreview"] = .bool(isTruncated)
+            if isTruncated {
+                out["hint"] = .string(
+                    "This is the first \(Self.previewChars) chars. Call read_note again with full=true (or chunkIndex on very long notes) only if the user explicitly asks for more."
+                )
+            }
+            out["citations"] = .array([citation.jsonValue])
+            return .object(out)
+        }
 
         if note.body.count <= Self.chunkThresholdChars {
             return .object(

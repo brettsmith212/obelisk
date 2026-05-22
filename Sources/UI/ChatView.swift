@@ -88,6 +88,42 @@ struct ChatView: View {
                 )
             }
         }
+        // Phase C: every `obsidian://open?…&file=…` URL the user taps
+        // — from the Sources card or from a wikilink in assistant
+        // prose — flows through SwiftUI's openURL environment. We
+        // intercept once here to record a frecency event before
+        // letting the system open Obsidian. Source defaults to
+        // `.sourcesTap` (we can't distinguish from this layer, and
+        // the source field is diagnostic-only today).
+        .environment(\.openURL, OpenURLAction { url in
+            if let path = Self.notePath(from: url) {
+                let frecency = env.frecency
+                Task.detached(priority: .utility) {
+                    frecency.recordOpen(path: path, source: .sourcesTap)
+                }
+            }
+            return .systemAction(url)
+        })
+    }
+
+    /// Vault-relative path encoded in an `obsidian://open?vault=…&file=…`
+    /// URL, with `.md` re-appended (`SourcesCard.deepLink` strips it
+    /// when building the link). Returns nil for any other scheme.
+    private static func notePath(from url: URL) -> String? {
+        guard url.scheme == "obsidian",
+              let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              components.host == "open"
+        else { return nil }
+        guard var file = components.queryItems?
+            .first(where: { $0.name == "file" })?.value,
+              !file.isEmpty
+        else { return nil }
+        // Strip wikilink heading/block fragments so the frecency event
+        // keys on the note, not its anchor.
+        if let hashRange = file.range(of: "#") {
+            file = String(file[..<hashRange.lowerBound])
+        }
+        return file.lowercased().hasSuffix(".md") ? file : file + ".md"
     }
 
     // MARK: - Status pill
@@ -450,10 +486,16 @@ private struct MessageListView: View {
                 if let newID { withAnimation { proxy.scrollTo(newID, anchor: .bottom) } }
             }
             .onChange(of: conversation.messages.last?.content) { _, _ in
+                // No animation, no withAnimation: during streaming this
+                // fires once per token. Wrapping each call in an
+                // animation forces SwiftUI to interpolate every layout
+                // pass against the in-flight animation; with long
+                // assistant messages the layout engine can fail to
+                // converge between updates and the main thread spins
+                // inside `ViewLayoutEngine.sizeThatFits` (UI freeze).
+                // A bare `scrollTo` is plenty for tail-following.
                 if let id = conversation.messages.last?.id {
-                    withAnimation(.linear(duration: 0.1)) {
-                        proxy.scrollTo(id, anchor: .bottom)
-                    }
+                    proxy.scrollTo(id, anchor: .bottom)
                 }
             }
             // The Sources card appears only after a turn settles to
@@ -471,12 +513,11 @@ private struct MessageListView: View {
             // Same idea for the streamed tool-call rows: a late-arriving
             // tool result can grow the assistant turn after the last
             // content delta. Re-anchor whenever the toolCalls array on
-            // the trailing message changes shape.
+            // the trailing message changes shape — but again without an
+            // animation wrapper, for the same convergence reason.
             .onChange(of: conversation.messages.last?.toolCalls.count) { _, _ in
                 if let id = conversation.messages.last?.id {
-                    withAnimation(.linear(duration: 0.1)) {
-                        proxy.scrollTo(id, anchor: .bottom)
-                    }
+                    proxy.scrollTo(id, anchor: .bottom)
                 }
             }
         }
@@ -769,12 +810,16 @@ private struct TypingIndicator: View {
 private struct EmptyStateView: View {
     let onPickSuggestion: (String) -> Void
 
-    // Suggestions exercise the Phase B vault toolset end-to-end:
-    // search → recent activity → backlinks. Tappable to populate the
-    // input; not auto-sent (matches the Phase A behavior).
+    // Suggestions exercise the Phase C vault toolset end-to-end:
+    // browse enumeration → keyword search → backlinks. Tappable to
+    // populate the input; not auto-sent (matches the Phase A
+    // behavior). Per phase-c.md §9, the enumeration prompt now
+    // routes to `browse_vault` so the user can confirm the new
+    // tool from the gate.
     private let suggestions = [
+        "What notes do I have?",
         "Search my vault for productivity.",
-        "What notes did I touch in the last 3 days?",
+        "What have I been working on lately?",
         "What links to [[Master Branch]]?"
     ]
 

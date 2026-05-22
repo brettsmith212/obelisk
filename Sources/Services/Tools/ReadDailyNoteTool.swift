@@ -64,6 +64,7 @@ struct ReadDailyNoteTool: Tool {
 
         // Index first — that's the source of truth for "currently exists".
         if let note = try index.note(at: relativePath) {
+            recordOpen(path: note.path)
             let citation = Citation(
                 path: note.path,
                 title: note.title,
@@ -133,6 +134,7 @@ struct ReadDailyNoteTool: Tool {
         }
 
         try upsertIntoIndex(result: result, title: title)
+        recordOpen(path: result.relativePath)
 
         let citation = Citation(
             path: result.relativePath,
@@ -181,6 +183,15 @@ struct ReadDailyNoteTool: Tool {
     }
 
     // MARK: - Helpers
+
+    /// Fire-and-forget frecency event. Same pattern as `ReadNoteTool`
+    /// (phase-c.md §8): tap-style INSERT off the tool's hot path.
+    private func recordOpen(path: String) {
+        let frecency = index.frecency
+        Task.detached(priority: .utility) {
+            frecency.recordOpen(path: path, source: .dailyNote)
+        }
+    }
 
     /// Parse the caller's `date` argument as an ISO-8601 calendar day.
     /// Missing → today (UTC start-of-day to match how daily notes are
