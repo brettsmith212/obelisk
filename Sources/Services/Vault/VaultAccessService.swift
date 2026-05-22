@@ -20,11 +20,44 @@ final class VaultAccessService {
     /// gated by `VaultGateView`.
     private(set) var activeVault: VaultHandle?
 
+    /// User-managed deny list, layered onto `VaultWriter.defaultDenyList`.
+    /// Edited from the Vault Settings sheet; persisted in
+    /// `UserDefaults`. Folder names match against any path segment
+    /// (case-insensitive) — see [VaultWriter](./VaultWriter.swift).
+    private(set) var userDenyList: [String]
+
     private let defaults: UserDefaults
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
         self.activeVault = Self.restorePersistedBinding(defaults: defaults)
+        self.userDenyList = (defaults.array(forKey: Keys.userDenyList) as? [String]) ?? []
+    }
+
+    // MARK: - User deny list
+
+    /// Replace the user's deny list with `entries`, deduped and trimmed.
+    /// Empty strings and the hard-coded defaults (`.obsidian`, `.trash`)
+    /// are filtered out — they're enforced unconditionally by the writer.
+    func setUserDenyList(_ entries: [String]) {
+        let cleaned: [String] = entries
+            .map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "/ ")) }
+            .filter { !$0.isEmpty }
+            .filter { entry in
+                !VaultWriter.defaultDenyList.contains { $0.caseInsensitiveCompare(entry) == .orderedSame }
+            }
+        // Preserve order while deduping case-insensitively.
+        var seen = Set<String>()
+        var deduped: [String] = []
+        for entry in cleaned {
+            let key = entry.lowercased()
+            if !seen.contains(key) {
+                seen.insert(key)
+                deduped.append(entry)
+            }
+        }
+        userDenyList = deduped
+        defaults.set(deduped, forKey: Keys.userDenyList)
     }
 
     // MARK: - Binding
@@ -83,8 +116,9 @@ final class VaultAccessService {
     }
 
     private enum Keys {
-        static let binding  = "obelisk.activeVault.binding"
-        static let bookmark = "obelisk.activeVault.bookmark"
+        static let binding      = "obelisk.activeVault.binding"
+        static let bookmark     = "obelisk.activeVault.bookmark"
+        static let userDenyList = "obelisk.vault.userDenyList"
     }
 
     private static func restorePersistedBinding(defaults: UserDefaults) -> VaultHandle? {

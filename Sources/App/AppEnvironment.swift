@@ -81,6 +81,12 @@ final class AppEnvironment {
         let rootURLProvider: @Sendable () async -> URL? = { [weak access] in
             await MainActor.run { access?.activeVault?.rootURL }
         }
+        // Same shape for the user's deny list — sourced from
+        // `VaultAccessService` so edits in the Vault Settings sheet
+        // take effect on the next tool call without re-registering.
+        let denyListProvider: @Sendable () async -> [String] = { [weak access] in
+            await MainActor.run { access?.userDenyList ?? [] }
+        }
         return [
             DateTimeTool(),
             CalculatorTool(),
@@ -89,8 +95,16 @@ final class AppEnvironment {
             ListNotesByTagTool(index: index),
             GetBacklinksTool(index: index),
             ListRecentNotesTool(index: index),
-            ReadDailyNoteTool(index: index, rootURLProvider: rootURLProvider),
-            CreateNoteTool(index: index, rootURLProvider: rootURLProvider),
+            ReadDailyNoteTool(
+                index: index,
+                rootURLProvider: rootURLProvider,
+                userDenyListProvider: denyListProvider
+            ),
+            CreateNoteTool(
+                index: index,
+                rootURLProvider: rootURLProvider,
+                userDenyListProvider: denyListProvider
+            ),
         ]
     }
 }

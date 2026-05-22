@@ -28,10 +28,16 @@ struct ReadDailyNoteTool: Tool {
 
     private let index: VaultIndex
     private let rootURLProvider: @Sendable () async -> URL?
+    private let userDenyListProvider: @Sendable () async -> [String]
 
-    init(index: VaultIndex, rootURLProvider: @escaping @Sendable () async -> URL?) {
+    init(
+        index: VaultIndex,
+        rootURLProvider: @escaping @Sendable () async -> URL?,
+        userDenyListProvider: @escaping @Sendable () async -> [String] = { [] }
+    ) {
         self.index = index
         self.rootURLProvider = rootURLProvider
+        self.userDenyListProvider = userDenyListProvider
     }
 
     func run(arguments: JSONValue) async throws -> JSONValue {
@@ -71,10 +77,9 @@ struct ReadDailyNoteTool: Tool {
         }
 
         if createIfMissing {
-            return try createDailyNote(
+            return try await createDailyNote(
                 relativePath: relativePath,
                 filename: filename,
-                folder: config.folder,
                 date: date,
                 rootURL: rootURL
             )
@@ -96,17 +101,14 @@ struct ReadDailyNoteTool: Tool {
     private func createDailyNote(
         relativePath: String,
         filename: String,
-        folder: String,
         date: Date,
         rootURL: URL
-    ) throws -> JSONValue {
+    ) async throws -> JSONValue {
         let title = filename.replacingOccurrences(of: ".md", with: "")
-        let dailyFolderToken = folder
-            .trimmingCharacters(in: CharacterSet(charactersIn: "/ "))
-        // Daily notes are an Obsidian-sanctioned write target, not a
-        // generic Obelisk write, so we widen the authorized folder set
-        // to include whatever the user has configured (or the root).
-        let allowed = Array(Set(VaultWriter.defaultAuthorizedFolders + [dailyFolderToken]))
+        // No folder special-case: under the denylist model the daily
+        // notes folder is implicitly writable unless the user added it
+        // to their deny list (in which case refusal is the right call).
+        let userDenyList = await userDenyListProvider()
 
         let result: VaultWriter.WriteResult
         do {
@@ -119,7 +121,7 @@ struct ReadDailyNoteTool: Tool {
                 ],
                 body: "",
                 in: rootURL,
-                authorizedFolders: allowed
+                userDenyList: userDenyList
             )
         } catch let error as VaultWriter.WriteError {
             throw ToolError.executionFailed(error.localizedDescription)

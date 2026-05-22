@@ -41,6 +41,21 @@ actor VaultScanner {
         let durationSeconds: Double
     }
 
+    /// Structured failures the scanner can surface. The only one users
+    /// see today is `.iCloudNotDownloaded` — the spec wants a specific
+    /// red banner ("Mark the folder as 'Keep on this iPhone'…") rather
+    /// than a generic "scan failed" pill.
+    enum ScanError: LocalizedError, Equatable {
+        case iCloudNotDownloaded
+
+        var errorDescription: String? {
+            switch self {
+            case .iCloudNotDownloaded:
+                return "Vault not fully downloaded from iCloud. Mark the folder as 'Keep on this iPhone' and try again."
+            }
+        }
+    }
+
     private let index: VaultIndex
 
     init(index: VaultIndex) {
@@ -92,6 +107,16 @@ actor VaultScanner {
 
         // Phase 1: enumerate live files (cheap, no parsing).
         let inventory = try VaultScanner.enumerateMarkdown(rootURL: rootURL)
+
+        // Refuse to index a partly-downloaded iCloud vault — half the
+        // notes would silently go missing and the model would hallucinate
+        // confidently about an incomplete corpus (phase-b.md §8 step 15).
+        // The UI turns this into a red status pill with a "tap to retry"
+        // affordance once the user marks the folder "Keep on this iPhone".
+        if inventory.iCloudPlaceholders > 0 {
+            throw ScanError.iCloudNotDownloaded
+        }
+
         report(.started(totalFiles: inventory.files.count, mode: mode))
 
         // Phase 2: hash + parse only changed files. Untouched files still
@@ -199,35 +224,57 @@ actor VaultScanner {
         let keys: [URLResourceKey] = [
             .isRegularFileKey, .contentModificationDateKey, .nameKey,
         ]
+        // We can't use `.skipsHiddenFiles` here because iCloud placeholder
+        // files are dot-prefixed (`.Foo.md.icloud`) — skipping hidden
+        // files would also skip the very signal we need to detect a
+        // half-downloaded vault. We apply the hidden-folder policy
+        // manually below instead.
         guard let enumerator = fm.enumerator(
             at: rootURL,
-            includingPropertiesForKeys: keys,
-            options: [.skipsHiddenFiles]
+            includingPropertiesForKeys: keys
         ) else {
             return Inventory(files: [], iCloudPlaceholders: 0)
         }
 
-        // Folder prefixes we never index. `.obsidian/` is hidden so the
-        // enumerator skips it already; this is the explicit allowlist
-        // anyway for clarity. `obelisk/` is *not* skipped — that's the
-        // authorized write target and we very much want to index it.
-        let excludedPrefixes = [".trash/", ".git/"]
+        // Folder names we never index. Includes Obsidian's own metadata
+        // (`.obsidian/` would brick the vault if we touched its config)
+        // and the trash. `obelisk/` is *not* excluded — that's our
+        // authorized write target and must be indexed.
+        let excludedDirNames: Set<String> = [".obsidian", ".trash", ".git"]
 
         var files: [Inventory.File] = []
         var placeholders = 0
 
         for case let url as URL in enumerator {
             let name = url.lastPathComponent
+            let rel = relativePath(of: url, root: rootURL)
+
+            // Skip excluded directories outright (and don't descend),
+            // and skip anything already underneath one of them.
+            let isDirectory = (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
+            if isDirectory, excludedDirNames.contains(name) {
+                enumerator.skipDescendants()
+                continue
+            }
+            if excludedDirNames.contains(where: { rel.hasPrefix($0 + "/") }) {
+                continue
+            }
+
             // iCloud placeholder files look like `.Foo.md.icloud` — when
             // the file has been evicted, the real bytes live in the
-            // cloud. We can't read them, so count + skip.
+            // cloud. We can't read them, so count + skip and let the
+            // scanner refuse to index per phase-b.md §8 step 15.
             if name.hasSuffix(".icloud") {
                 placeholders += 1
                 continue
             }
+
+            // Past the placeholder check, anything still starting with
+            // a dot is a user/system hidden file we don't care about
+            // (e.g. `.DS_Store`, or a personal sidecar). Skip silently.
+            if name.hasPrefix(".") { continue }
+
             guard url.pathExtension.lowercased() == "md" else { continue }
-            let rel = relativePath(of: url, root: rootURL)
-            if excludedPrefixes.contains(where: { rel.hasPrefix($0) }) { continue }
 
             let resourceValues = try? url.resourceValues(forKeys: Set(keys))
             let modified = resourceValues?.contentModificationDate ?? .distantPast

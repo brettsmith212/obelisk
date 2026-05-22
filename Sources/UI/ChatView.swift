@@ -17,6 +17,7 @@ struct ChatView: View {
     @State private var drawerOpen: Bool = false
     @State private var editingMessageID: UUID? = nil
     @State private var editingText: String = ""
+    @State private var settingsOpen: Bool = false
 
     private var manager: ConversationManager { env.manager }
     private var agent: AgentService { env.agent }
@@ -44,6 +45,9 @@ struct ChatView: View {
             .offset(x: drawerOpen ? 0 : -320)
             .animation(.easeInOut(duration: 0.22), value: drawerOpen)
         }
+        .sheet(isPresented: $settingsOpen) {
+            VaultSettingsView(env: env, onDismiss: { settingsOpen = false })
+        }
     }
 
     // MARK: - Main column
@@ -55,6 +59,8 @@ struct ChatView: View {
             VStack(spacing: 0) {
                 topBar
                 Divider().background(Color.obBorder)
+
+                activeStatusPill()
 
                 if let conversation = manager.activeConversation, !conversation.messages.isEmpty {
                     MessageListView(
@@ -84,6 +90,29 @@ struct ChatView: View {
         }
     }
 
+    // MARK: - Status pill
+
+    /// Maps the indexing service's status onto a `StatusPill`. Only the
+    /// `.failed` case surfaces UI today (phase-b.md §8 step 15 — iCloud
+    /// not fully downloaded). `.scanning` / `.ready` stay silent in the
+    /// chat shell; the Settings sheet (step 9) renders them once it
+    /// exists.
+    @ViewBuilder
+    private func activeStatusPill() -> some View {
+        switch env.vaultIndexing.status {
+        case .failed(let message):
+            StatusPill(
+                kind: .red,
+                message: message,
+                onTap: env.vaultAccess.activeVault.map { handle in
+                    { env.vaultIndexing.reindex(handle: handle) }
+                }
+            )
+        default:
+            EmptyView()
+        }
+    }
+
     private var topBar: some View {
         HStack {
             Button(action: { drawerOpen.toggle() }) {
@@ -95,9 +124,13 @@ struct ChatView: View {
                 .font(.obTitle)
                 .foregroundStyle(Color.obTextPrimary)
             Spacer()
-            // Overflow menu — rename/delete/export land in Phase F.
-            Image(systemName: "ellipsis")
-                .foregroundStyle(Color.obTextPrimary.opacity(0.25))
+            // Overflow menu — Vault Settings lives here in Phase B
+            // (phase-b.md §8 step 9); rename/delete/export land in Phase F.
+            Button(action: { settingsOpen = true }) {
+                Image(systemName: "ellipsis")
+                    .foregroundStyle(Color.obTextPrimary)
+            }
+            .accessibilityLabel("Vault settings")
         }
         .padding(.horizontal, ObSpacing.screenH)
         .padding(.vertical, 12)

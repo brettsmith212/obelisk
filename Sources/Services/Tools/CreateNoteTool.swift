@@ -1,32 +1,34 @@
 import Foundation
 import CryptoKit
 
-/// Create a note in the user's Obsidian vault under an authorized
-/// folder. All "do no harm" enforcement lives in `VaultWriter` — this
-/// tool's job is to shape the request (filename, frontmatter, body)
-/// and to keep `VaultIndex` consistent so a follow-up read tool sees
-/// the new note immediately.
+/// Create a note in the user's Obsidian vault. All "do no harm"
+/// enforcement lives in `VaultWriter` — this tool's job is to shape
+/// the request (filename, frontmatter, body) and to keep `VaultIndex`
+/// consistent so a follow-up read tool sees the new note immediately.
 ///
 /// Args (phase-b.md §7):
 /// - `title` (required): becomes the note's filename stem and a
 ///   `title:` frontmatter key.
 /// - `body` (required): markdown body.
-/// - `folder` (optional, default `"obelisk"`): authorized vault
-///   subfolder to drop the file into.
+/// - `folder` (optional, default `"obelisk"`): vault subfolder to drop
+///   the file into. Refused if any segment of the resulting path is on
+///   the deny list (`.obsidian`, `.trash`, plus user-configured
+///   entries).
 /// - `tags` (optional): array of tag names (no leading '#').
 struct CreateNoteTool: Tool {
     let name = "create_note"
     let description = """
-    Create a new note in the user's Obsidian vault. Only writes into \
-    Obelisk's authorized folder (default 'obelisk/'). The note is \
-    stamped with 'source: obelisk' frontmatter and an optional list \
-    of tags. Use this for prompts like 'save a note about X'.
+    Create a new note in the user's Obsidian vault. Defaults to the \
+    'obelisk/' folder but can write anywhere except the user's deny \
+    list. The note is stamped with 'source: obelisk' frontmatter and \
+    an optional list of tags. Use this for prompts like 'save a note \
+    about X'.
     """
     let argumentsSchema: JSONSchema = .object(
         properties: [
             "title":  .string(description: "Note title — becomes both the filename and the 'title' frontmatter key."),
             "body":   .string(description: "Markdown body."),
-            "folder": .string(description: "Optional authorized subfolder. Default 'obelisk'."),
+            "folder": .string(description: "Optional vault subfolder. Default 'obelisk'."),
             "tags":   .array(items: .string(description: "Tag name without '#'."),
                              description: "Optional tags to write into frontmatter."),
         ],
@@ -35,10 +37,16 @@ struct CreateNoteTool: Tool {
 
     private let index: VaultIndex
     private let rootURLProvider: @Sendable () async -> URL?
+    private let userDenyListProvider: @Sendable () async -> [String]
 
-    init(index: VaultIndex, rootURLProvider: @escaping @Sendable () async -> URL?) {
+    init(
+        index: VaultIndex,
+        rootURLProvider: @escaping @Sendable () async -> URL?,
+        userDenyListProvider: @escaping @Sendable () async -> [String] = { [] }
+    ) {
         self.index = index
         self.rootURLProvider = rootURLProvider
+        self.userDenyListProvider = userDenyListProvider
     }
 
     func run(arguments: JSONValue) async throws -> JSONValue {
@@ -77,13 +85,15 @@ struct CreateNoteTool: Tool {
             frontmatter["tags"] = .stringList(tags)
         }
 
+        let userDenyList = await userDenyListProvider()
         let result: VaultWriter.WriteResult
         do {
             result = try VaultWriter.write(
                 relativePath: relativePath,
                 frontmatter: frontmatter,
                 body: body,
-                in: rootURL
+                in: rootURL,
+                userDenyList: userDenyList
             )
         } catch let error as VaultWriter.WriteError {
             // Surface the writer's structured errors as tool errors so

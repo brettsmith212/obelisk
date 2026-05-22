@@ -4,37 +4,42 @@ import Foundation
 ///
 /// Implements the "do no harm" rules from
 /// [roadmap.md §"The 'do no harm' rules for vault writes"](../../../roadmap.md)
-/// and phase-b.md §8 step 11:
+/// and phase-b.md §8 step 9:
 ///
-/// - **Authorized folders.** Writes are refused unless the target path
-///   sits under an allowed top-level folder. Default is `obelisk/`.
+/// - **Denylist gating.** Writes are refused if any segment of the
+///   target path falls inside a denied folder. A hard-coded
+///   `defaultDenyList` blocks `.obsidian/` and `.trash/` (editing
+///   Obsidian's own config bricks the vault); an additional
+///   `userDenyList` can be provided per call from `VaultAccessService`,
+///   which the Vault Settings sheet edits.
 /// - **Identity marker.** Every file Obelisk writes carries
 ///   `source: obelisk` in its YAML frontmatter. The writer injects this
 ///   automatically so callers never have to.
 /// - **No clobbering.** If a file already exists at the target path, the
 ///   writer reads its frontmatter; if `source: obelisk` is absent, the
-///   write is refused. (User-authored notes are untouchable.)
+///   write is refused. This is the load-bearing safety net under the
+///   denylist model — user-authored notes anywhere in the vault stay
+///   untouchable even though their parent folder is implicitly writable.
 /// - **Atomicity.** Bytes land via a sibling temp file + `replaceItemAt`,
 ///   so a mid-write crash never leaves a half-written file.
 ///
 /// Stateless on purpose — tests / future tools can call it directly
 /// without dragging the rest of the vault layer in.
 enum VaultWriter {
-    /// Folders inside the vault that Obelisk is allowed to write into.
-    /// Conservative by design — the user can grant more in a future
-    /// "authorized folders" UI (phase-b.md §2 stretch).
-    static let defaultAuthorizedFolders: [String] = ["obelisk"]
+    /// Folders the writer will never touch, no matter what the user
+    /// configures. Editing `.obsidian/` corrupts the vault config;
+    /// `.trash/` is reserved for Obsidian's own delete flow.
+    static let defaultDenyList: [String] = [".obsidian", ".trash"]
 
     enum WriteError: Error, LocalizedError, Equatable {
-        case unauthorizedFolder(path: String, allowed: [String])
+        case deniedFolder(path: String, deniedSegment: String)
         case wouldOverwriteForeignNote(path: String)
         case invalidPath(String)
 
         var errorDescription: String? {
             switch self {
-            case .unauthorizedFolder(let path, let allowed):
-                let list = allowed.map { "'\($0)/'" }.joined(separator: ", ")
-                return "Refusing to write to '\(path)' — Obelisk can only write inside: \(list)."
+            case .deniedFolder(let path, let segment):
+                return "Refusing to write to '\(path)' — '\(segment)/' is in the deny list."
             case .wouldOverwriteForeignNote(let path):
                 return "Refusing to overwrite '\(path)' — that note wasn't created by Obelisk."
             case .invalidPath(let detail):
@@ -62,21 +67,25 @@ enum VaultWriter {
     /// Build a note from frontmatter + body, then atomically write it
     /// to `<vaultRoot>/<relativePath>`. The writer takes care of:
     ///
-    /// - Validating the target path stays under an authorized folder.
+    /// - Validating the target path against the deny list.
     /// - Injecting `source: obelisk` (preserving any caller-supplied
     ///   frontmatter keys).
     /// - Refusing to overwrite a file Obelisk didn't create.
     /// - Creating any missing intermediate directories.
+    ///
+    /// `userDenyList` is layered onto `defaultDenyList`; pass `[]` when
+    /// no user customization applies.
     @discardableResult
     static func write(
         relativePath: String,
         frontmatter: [String: FrontmatterValue],
         body: String,
         in vaultRoot: URL,
-        authorizedFolders: [String] = defaultAuthorizedFolders
+        userDenyList: [String] = []
     ) throws -> WriteResult {
         let cleanedRelative = try normalize(relativePath: relativePath)
-        try checkAuthorized(path: cleanedRelative, allowed: authorizedFolders)
+        let effectiveDenyList = defaultDenyList + userDenyList
+        try checkNotDenied(path: cleanedRelative, denied: effectiveDenyList)
 
         let absoluteURL = vaultRoot.appending(path: cleanedRelative, directoryHint: .notDirectory)
         let directoryURL = absoluteURL.deletingLastPathComponent()
@@ -112,20 +121,22 @@ enum VaultWriter {
         return cleaned
     }
 
-    /// Folder-level authorization. The first path segment ("" for files
-    /// living at the vault root) must match one of the allowed entries
-    /// (case-insensitive, trailing slashes ignored).
-    ///
-    /// Allowing `""` means "vault root only" — useful for daily notes
-    /// when the user's Obsidian setup files them at the root.
-    private static func checkAuthorized(path: String, allowed: [String]) throws {
-        let segments = path.split(separator: "/", omittingEmptySubsequences: false)
-        let topLevel: String = segments.count > 1 ? String(segments[0]) : ""
-        let normalized = allowed.map {
-            $0.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "/ "))
-        }
-        guard normalized.contains(topLevel.lowercased()) else {
-            throw WriteError.unauthorizedFolder(path: path, allowed: allowed)
+    /// Denylist gate. The check matches *any* segment of the relative
+    /// path (folder or filename stem) against the configured deny
+    /// entries — so `.obsidian/foo.md` and `archive/.obsidian/foo.md`
+    /// both fail. Comparison is case-insensitive; user-supplied entries
+    /// are trimmed of surrounding `/` and whitespace.
+    private static func checkNotDenied(path: String, denied: [String]) throws {
+        let segments = path
+            .split(separator: "/", omittingEmptySubsequences: true)
+            .map { String($0).lowercased() }
+        let normalizedDenied: [String] = denied
+            .map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "/ ")).lowercased() }
+            .filter { !$0.isEmpty }
+        for entry in normalizedDenied {
+            if segments.contains(entry) {
+                throw WriteError.deniedFolder(path: path, deniedSegment: entry)
+            }
         }
     }
 
