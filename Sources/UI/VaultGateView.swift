@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 /// Pre-chat onboarding gate (ui-spec.md §3.5 step 2, narrowed for Phase B).
 /// Shown whenever `VaultAccessService.activeVault == nil` — until a vault
@@ -13,6 +14,7 @@ struct VaultGateView: View {
     let vaultAccess: VaultAccessService
 
     @State private var pickerErrorMessage: String?
+    @State private var showPicker: Bool = false
 
     var body: some View {
         ZStack {
@@ -37,10 +39,8 @@ struct VaultGateView: View {
                         title: "Choose vault folder…",
                         systemImage: "folder.badge.plus",
                         isPrimary: true,
-                        action: openPicker
+                        action: { showPicker = true }
                     )
-                    .disabled(true) // wired in the next sub-step
-                    .opacity(0.5)
 
                     #if DEBUG
                     sampleVaultButton
@@ -69,14 +69,34 @@ struct VaultGateView: View {
             }
             .padding(.horizontal, ObSpacing.screenH)
         }
+        .fileImporter(
+            isPresented: $showPicker,
+            allowedContentTypes: [.folder],
+            allowsMultipleSelection: false
+        ) { result in
+            handlePickerResult(result)
+        }
     }
 
-    // MARK: - Real picker (placeholder)
+    // MARK: - Real picker
 
-    private func openPicker() {
-        // Lands in the next Phase B sub-step (UIDocumentPickerViewController
-        // + security-scoped bookmark persistence + iCloud placeholder check).
-        pickerErrorMessage = "Vault picker not wired yet — use the sample vault button below."
+    private func handlePickerResult(_ result: Result<[URL], Error>) {
+        switch result {
+        case .success(let urls):
+            guard let url = urls.first else { return }
+            do {
+                try vaultAccess.pickVault(url: url)
+                pickerErrorMessage = nil
+            } catch {
+                pickerErrorMessage = error.localizedDescription
+            }
+        case .failure(let error):
+            // `.cancelled` looks like a generic NSError on iOS — show
+            // nothing for a user-initiated dismiss.
+            let nsError = error as NSError
+            if nsError.code == NSUserCancelledError { return }
+            pickerErrorMessage = error.localizedDescription
+        }
     }
 
     // MARK: - Sample vault (DEBUG)
