@@ -79,12 +79,13 @@ final class AppEnvironment {
         }
     }
 
-    /// Phase C toolset (phase-c.md §5.4): Phase A's `DateTimeTool` +
-    /// `CalculatorTool` and the Phase B vault tools, with two
-    /// enumeration tools (`list_recent_notes`, `list_notes_by_tag`)
-    /// collapsed into the new `BrowseVaultTool` and `SearchVaultTool`
-    /// upgraded to FTS5 + frecency. Total: 8 tools — comfortably under
-    /// the 10-tool ceiling.
+    /// AFM-realistic toolset: just `find` (surface notes by keyword,
+    /// tag, folder, or backlinks) and `read` (read one note by path
+    /// or as today's daily). Two tools collapse the previous six so
+    /// AFM's routing decision shrinks to a single binary choice —
+    /// list vs. content — which a ~3B model can actually make
+    /// reliably. Apple's TN3193 caps the recommended tool count at
+    /// 3–5; we sit comfortably under that.
     @MainActor
     static func defaultTools(index: VaultIndex, access: VaultAccessService) -> [any Tool] {
         // Snapshot the active vault's root URL on demand for tools that
@@ -94,29 +95,9 @@ final class AppEnvironment {
         let rootURLProvider: @Sendable () async -> URL? = { [weak access] in
             await MainActor.run { access?.activeVault?.rootURL }
         }
-        // Same shape for the user's deny list — sourced from
-        // `VaultAccessService` so edits in the Vault Settings sheet
-        // take effect on the next tool call without re-registering.
-        let denyListProvider: @Sendable () async -> [String] = { [weak access] in
-            await MainActor.run { access?.userDenyList ?? [] }
-        }
         return [
-            DateTimeTool(),
-            CalculatorTool(),
-            SearchVaultTool(index: index),
-            BrowseVaultTool(index: index),
-            ReadNoteTool(index: index),
-            GetBacklinksTool(index: index),
-            ReadDailyNoteTool(
-                index: index,
-                rootURLProvider: rootURLProvider,
-                userDenyListProvider: denyListProvider
-            ),
-            CreateNoteTool(
-                index: index,
-                rootURLProvider: rootURLProvider,
-                userDenyListProvider: denyListProvider
-            ),
+            FindTool(index: index),
+            ReadTool(index: index, rootURLProvider: rootURLProvider),
         ]
     }
 }

@@ -95,16 +95,14 @@ struct AgentService: Sendable {
                 //      `browse_vault`) must not be called more than
                 //      once in the same turn — two pages of results
                 //      blow the window.
-                //   2. `maxTotalCalls`: cap total tool invocations
-                //      per turn at 2. One was too restrictive — the
-                //      model frequently re-runs search_vault in a
-                //      follow-up turn ("what does it say?") and then
-                //      needs read_note. Two calls accommodates that.
-                //      Tool outputs are kept compact (browse: 10
-                //      rows w/o snippets; search: trimmed snippets;
-                //      read_note: small preview by default) so the
-                //      two outputs still fit the 4096-token window.
-                let turnGuard = TurnGuard(singleCall: ["browse_vault"], maxTotalCalls: 2)
+                //   2. `maxTotalCalls`: ONE tool call per user turn.
+                //      Hard limit. AFM's 4096-token window cannot
+                //      reliably fit two tool outputs plus their
+                //      schemas plus a reply. Multi-step intent
+                //      ("find and read") becomes two user turns.
+                //      This is the only setting we found that
+                //      didn't accumulate bandaids.
+                let turnGuard = TurnGuard(singleCall: ["find"], maxTotalCalls: 1)
                 let dispatch: @Sendable (UUID, String, JSONValue) async -> ToolResult = { id, name, args in
                     switch await turnGuard.shouldBlock(name) {
                     case .allow:

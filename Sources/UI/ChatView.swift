@@ -746,10 +746,9 @@ private struct ToolCallRow: View {
     /// Inline glyph for the tool family per ui-spec §4.5.
     private var glyph: String {
         switch call.name {
-        case "datetime":   "⏱"
-        case "calculator": "🧮"
-        case "scratchpad": "📄"
-        default:           "🔧"
+        case "find": "🔎"
+        case "read": "📄"
+        default:     "🔧"
         }
     }
 
@@ -810,16 +809,13 @@ private struct TypingIndicator: View {
 private struct EmptyStateView: View {
     let onPickSuggestion: (String) -> Void
 
-    // Suggestions exercise the Phase C vault toolset end-to-end:
-    // browse enumeration → keyword search → backlinks. Tappable to
-    // populate the input; not auto-sent (matches the Phase A
-    // behavior). Per phase-c.md §9, the enumeration prompt now
-    // routes to `browse_vault` so the user can confirm the new
-    // tool from the gate.
+    // Suggestions exercise the 2-tool AFM-realistic surface:
+    // `find` (recency / keyword / backlinks) and `read` (daily).
+    // Tappable to populate the input, not auto-sent.
     private let suggestions = [
         "What notes do I have?",
         "Search my vault for productivity.",
-        "What have I been working on lately?",
+        "Open today's daily note.",
         "What links to [[Master Branch]]?"
     ]
 

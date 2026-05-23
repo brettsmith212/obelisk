@@ -102,17 +102,19 @@ actor AppleFoundationRunner: LLMRunner {
             continuation.finish(throwing: AppleFoundationRunnerError.missingUserMessage)
             return
         }
-        let fullHistory = Array(messages.prefix(lastUserIndex))
         let userMessage = messages[lastUserIndex]
 
-        // Trim history to fit the AFM 4096-token window. Tool-heavy
-        // turns (e.g. browse_vault returning a long bulleted list) blow
-        // the budget within two exchanges. Walk backward and keep the
-        // newest turns whose combined character count stays under a
-        // conservative budget; the model loses long-ago context but
-        // keeps near-term coherence — much better than silently failing
-        // to generate.
-        let history = Self.trimHistory(fullHistory, maxChars: 6000)
+        // ZERO transcript replay. AFM-realistic mode: each user turn
+        // is treated as a fresh prompt. The model still sees the
+        // system instructions and the full tool registry, but no
+        // prior turns. This is the only configuration that doesn't
+        // accumulate context bloat across multi-turn flows.
+        //
+        // Trade-off: the model can't reference "the note I just
+        // showed you" by short pronoun. The system prompt and tool
+        // results carry enough signal for one-shot questions, which
+        // is what AFM is actually good at.
+        let history: [Message] = []
 
         // 3. Build FoundationModels Tool adapters from descriptors.
         let adapters: [any FoundationModels.Tool]

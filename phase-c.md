@@ -62,14 +62,14 @@ End-of-phase, on a physical iPhone 15 Pro / 16 Pro running iOS 26:
               │ (Sources tap, wikilink tap → note_opens)
               ▼
 ╭─────────────────────────────────────────────────────╮
-│  ToolDispatcher                                     │
-│   · existing 8 Phase-B tools, minus 2 removals      │
-│   · adds:    BrowseVaultTool                        │
-│   · removes: ListRecentNotesTool                    │
-│              ListNotesByTagTool                     │
-│              (both absorbed by BrowseVaultTool)     │
-│   · upgrades: SearchVaultTool (description only,    │
-│     internals routed through new VaultIndex methods)│
+│  ToolDispatcher  (AFM-realistic: 2 tools only)      │
+│   · FindTool   — keyword / tag / folder / backlinks │
+│   · ReadTool   — read one note (by path or daily)   │
+│                                                     │
+│   Removed during the Phase-C AFM-realistic refactor:│
+│     SearchVaultTool, BrowseVaultTool, ReadNoteTool, │
+│     ReadDailyNoteTool, GetBacklinksTool,            │
+│     CreateNoteTool, DateTimeTool, CalculatorTool    │
 ╰─────────────┬───────────────────────────────────────╯
               │
               ▼
@@ -82,10 +82,15 @@ End-of-phase, on a physical iPhone 15 Pro / 16 Pro running iOS 26:
 │   · adds query methods:                             │
 │     search(query:)        — FTS5 + fuzzy + frecency │
 │     browse(...)           — paginated enumeration   │
+│     backlinks(to:)        — wikilink reverse index  │
 │     recordOpen(path:)     — frecency writer         │
 │     frecencyScore(path:)  — frecency reader         │
 ╰─────────────────────────────────────────────────────╯
 ```
+
+`FindTool` and `ReadTool` are thin shells over `VaultIndex`. The
+underlying search / browse / backlinks engines all still exist — only
+the *tool surface* was collapsed. See §5 for the rationale.
 
 ### 3.1 New type seams
 
@@ -111,15 +116,24 @@ Obelisk/
     VaultIndexSchema.swift           // adds migration v2
   Services/
     Vault/
-      VaultIndex.swift               // adds search/browse/frecency methods
+      VaultIndex.swift               // adds search / browse / backlinks / frecency
       FrecencyTracker.swift          // new — write side + decay math
       QueryParser.swift              // new — raw text → FTS5 MATCH expression
       FuzzyTitleMatcher.swift        // new — edit-distance fallback
+      VocabCache.swift               // new — notes_fts_v wrapper
     Tools/
-      SearchVaultTool.swift          // rewrite internals (same name, same args)
-      BrowseVaultTool.swift          // new (absorbs recent + tag enumeration)
-      ListRecentNotesTool.swift      // REMOVED
-      ListNotesByTagTool.swift       // REMOVED
+      FindTool.swift                 // new — search / browse / backlinks in one
+      ReadTool.swift                 // new — read by path or daily
+      SearchVaultTool.swift          // REMOVED (absorbed by FindTool)
+      BrowseVaultTool.swift          // REMOVED (absorbed by FindTool)
+      GetBacklinksTool.swift         // REMOVED (absorbed by FindTool)
+      ReadNoteTool.swift             // REMOVED (absorbed by ReadTool)
+      ReadDailyNoteTool.swift        // REMOVED (absorbed by ReadTool)
+      CreateNoteTool.swift           // REMOVED (write deferred to a `write` tool)
+      ListRecentNotesTool.swift      // REMOVED (Phase B)
+      ListNotesByTagTool.swift       // REMOVED (Phase B)
+      DateTimeTool.swift             // REMOVED (Phase A demo, no product value)
+      CalculatorTool.swift           // REMOVED (Phase A demo, no product value)
   UI/
     ChatView.swift                   // wire note-open events
     SourcesCard.swift                // tap → recordOpen
@@ -193,91 +207,151 @@ A note never opened: boost = 0, score = pure BM25. A long-favorite note: boost c
 
 ---
 
-## 5. New / changed tools
+## 5. Tools after the AFM-realistic refactor
 
-### 5.1 `search_vault` (upgraded)
+Phase C was originally specified to ship 8 tools (`search_vault`,
+`browse_vault`, `read_note`, `read_daily_note`, `get_backlinks`,
+`create_note`, `datetime`, `calculator`). Simulator QA against a real
+vault — combined with a deliberate read of Apple's
+[TN3193](https://developer.apple.com/documentation/technotes/tn3193-managing-the-on-device-foundation-model-s-context-window) —
+showed that count was wrong for AFM:
 
-Same args, same returns. Internally:
+- TN3193 explicitly caps the recommended tool count at **3–5**.
+- Every tool's `name + description + arg schema` is in the system
+  prompt on *every* turn, paid for out of the 4096-token window.
+- AFM's routing accuracy degrades sharply as the tool count grows or
+  as descriptions overlap in vocabulary ("search vault" vs
+  "browse vault" both say "vault notes").
+- The Phase A demo tools (`datetime`, `calculator`) had no product
+  value in a vault assistant and burned schema tokens for free.
 
-1. `QueryParser.parse(raw: args.query)` → `SearchQuery`.
-2. `VaultIndex.search(SearchQuery, tag:, folder:, limit:)`:
-   - Build FTS5 MATCH expression (see §6 below).
-   - Run with `bm25(notes_fts, 10.0, 1.0)` and `snippet(notes_fts, 1, '', '', '…', 16)`.
-   - If zero rows: re-run with OR-joined tokens.
-   - If still zero rows: fall through to `FuzzyTitleMatcher`.
-   - For each hit, multiply BM25 score by `(1 + frecencyBoost)` from `FrecencyTracker.score(path:)`.
-   - Sort by combined score, take top `limit`.
-3. Map to the existing `SearchHit` shape — UI is untouched.
+So we collapsed the surface to two verbs — **`find`** (which notes?)
+and **`read`** (what does this note say?) — and dropped the rest.
+This matches the "verbs of a vault" model (find / read / write) and
+puts AFM's routing decision on a binary that a ~3B model can actually
+make reliably.
 
-Description claim: every "find / search / look up / what's the note that says / show me notes about / what have I written about" prompt.
-
-### 5.2 `browse_vault` (new)
+### 5.1 `find` (new — surfaces notes)
 
 ```swift
-struct BrowseVaultTool: Tool {
-    let name = "browse_vault"
+struct FindTool: Tool {
+    let name = "find"
+    let description = "Find vault notes by keyword, tag, folder, or backlinks."
     let argumentsSchema: JSONSchema = .object(
         properties: [
-            "folder":           .string(description: "Optional vault-relative folder prefix (e.g. 'Projects', 'Daily Notes')."),
-            "tag":              .string(description: "Optional tag to filter by (no leading '#' required, e.g. 'project' or 'project/work')."),
-            "includeChildTags": .boolean(description: "When 'tag' is set, also include hierarchical children (e.g. tag='project' matches 'project/work'). Default true."),
-            "sortBy":           .string(
-                description: "How to sort: 'modified' (newest first) or 'title' (A→Z). Default 'modified'.",
-                enumValues: ["modified", "title"]
-            ),
-            "limit":            .integer(description: "Max notes to return per page. Default 25, cap 50."),
-            "offset":           .integer(description: "Number of notes to skip. Default 0. Use to paginate."),
+            "query":     .string(description: "Free-text keyword search."),
+            "tag":       .string(description: "Tag filter, no '#'."),
+            "folder":    .string(description: "Vault-relative folder prefix."),
+            "linked_to": .string(description: "Vault-relative path; returns notes that wikilink to it."),
+            "limit":     .integer(description: "Max notes. Default 10, cap 10."),
+            "offset":    .integer(description: "Skip count for paging browse results."),
         ],
         required: []
     )
 }
 ```
 
-Returns:
+Dispatch is **implicit in argument presence** — no `mode` enum, fewer
+schema tokens for AFM to digest:
+
+| Args supplied | Underlying call |
+|---|---|
+| `linked_to` | `VaultIndex.backlinks(to:, limit:)` |
+| `query` (with optional `tag` / `folder`) | `VaultIndex.search(query:, tag:, folder:, limit:)` |
+| neither (with optional `tag` / `folder`) | `VaultIndex.browse(folder:, tag:, includeChildTags: true, sortBy: .modified, limit:, offset:)` |
+
+Returns a flat envelope:
 
 ```json
 {
-  "notes":     [{ "path", "title", "modifiedAt" }, …],
-  "totalCount": 530,
-  "offset":     0,
-  "limit":      25,
-  "citations":  [ …Citation… ]
+  "notes":     [{ "path", "title" }, …],
+  "citations": [ …Citation… ],          // same set, UI's Sources card binds here
+  "totalCount": 530,                    // browse mode only
+  "hasMore":   true,                    // browse mode only
+  "nextOffset": 10                      // browse mode only, omitted when !hasMore
 }
 ```
 
-Description claim: every "list / enumerate / show me all / what notes do I have / what's in my <folder> folder / what's tagged #X / what have I been working on lately / recent notes / browse my vault" prompt.
+Snippets are **omitted** from the tool payload — every cited note row
+costs tokens, and the model only needs `path + title` to either reply
+or follow up with `read`. The Sources card builds its own snippet
+preview from the index when rendering.
 
-### 5.3 Tools removed in Phase C
+### 5.2 `read` (new — reads one note)
 
-Both removals are absorbed by the expanded `browse_vault` schema above. Phase B QA showed the 3B model could not reliably disambiguate near-duplicate enumeration tools; the cleanest fix is fewer, more orthogonal tools.
+```swift
+struct ReadTool: Tool {
+    let name = "read"
+    let description = "Read the contents of one vault note (by path, or today's daily)."
+    let argumentsSchema: JSONSchema = .object(
+        properties: [
+            "path":  .string(description: "Vault-relative path of any note."),
+            "daily": .string(description: "'today' or YYYY-MM-DD for the daily note."),
+            "full":  .boolean(description: "Return the full body instead of a preview."),
+        ],
+        required: []
+    )
+}
+```
 
-- **`ListRecentNotesTool` — removed.** "What have I been working on" → `browse_vault(sortBy="modified", limit=20)` returns the same shape. The `days` window was rarely used precisely; sort-by-modified is the actual signal users want.
-- **`ListNotesByTagTool` — removed.** "Show me my #project notes" → `browse_vault(tag="project", includeChildTags=true)`. Hierarchical tag expansion moves into `browse_vault`. Keyword-plus-tag queries already work via `search_vault(tag=…)`.
+Mutually-exclusive addressing: `daily` set → resolve via
+`.obsidian/daily-notes.json` and look up the resulting path; else
+`path` is consulted directly. If the daily note doesn't exist we
+return a `{ exists: false }` envelope rather than throwing, so the
+model can tell the user instead of erroring out.
 
-Delete the source files and remove the entries from `AppEnvironment.defaultTools(...)`. No data migration needed (these are read-only tools — no persisted state).
+`read` is **strictly read-only**. The original Phase B
+`ReadDailyNoteTool` had a `createIfMissing` flag; we dropped it
+because (a) it conflated reading with writing, and (b) creation
+belongs to a future `write` tool (see §13).
 
-### 5.4 Tool registry after Phase C
+Body defaults to a ~1500-char preview (`isPreview: true` in the
+envelope when truncated); `full: true` returns the whole body. The
+old `chunkIndex` arg was dropped — AFM almost never used it
+correctly, and the preview-or-full binary is enough.
 
-`AppEnvironment.defaultTools(index:access:)` returns **8 tools** (down from Phase B's 8, with the swap of two removals + one addition):
+### 5.3 Tool registry after Phase C
+
+`AppEnvironment.defaultTools(index:access:)` returns **2 tools**:
 
 ```
-DateTimeTool, CalculatorTool,
-SearchVaultTool, BrowseVaultTool, ReadNoteTool,
-GetBacklinksTool, ReadDailyNoteTool, CreateNoteTool
+FindTool, ReadTool
 ```
 
-Comfortably under the 10-tool ceiling. Each tool claims a distinct prompt shape:
+Sits well under TN3193's 3–5 ceiling and leaves headroom for a
+future `write` tool without crossing it. AFM's routing decision
+collapses to a single binary — "which notes?" vs "what's in *this*
+note?" — which the model handles with high reliability.
 
-| Prompt shape | Tool |
-|---|---|
-| "find / look up / show me notes about X" | `search_vault` |
-| "list / enumerate / what notes do I have / what's in folder X / what's tagged #Y / recent notes" | `browse_vault` |
-| "read note at path X" | `read_note` |
-| "today's note / daily note / journal" | `read_daily_note` |
-| "what links to X / backlinks" | `get_backlinks` |
-| "save / create / write a note" | `create_note` |
-| "what time / date is it" | `datetime` |
-| "compute / calculate" | `calculator` |
+| Prompt shape | Tool | Args set |
+|---|---|---|
+| "find / search / look up notes about X" | `find` | `query` |
+| "what notes do I have / recent notes / what have I been working on" | `find` | (none — defaults to recency) |
+| "show me my #X notes" | `find` | `tag` |
+| "what's in my <folder> folder" | `find` | `folder` |
+| "what links to X / backlinks" | `find` | `linked_to` |
+| "read note at path X" | `read` | `path` |
+| "today's note / daily note / journal" | `read` | `daily: "today"` |
+
+### 5.4 Companion guards in `AgentService`
+
+The two-tool surface alone isn't enough — AFM still speculatively
+chains tool calls. Three turn-scoped guards live in
+[AgentService.swift](./Sources/Services/AgentService.swift) and
+[AppleFoundationRunner.swift](./Sources/Services/AppleFoundationRunner.swift):
+
+- **`maxTotalCalls: 1`** — one tool call per assistant turn. AFM's
+  4096-token window cannot reliably fit two tool outputs plus their
+  schemas plus a reply. Multi-step intent becomes two user turns.
+- **Zero transcript replay** — each prompt is treated as a fresh
+  request; no prior turns are replayed to the model. Trades pronoun
+  follow-ups ("what does it say?") for predictable per-turn token
+  budgets. Apple's TN3193 endorses this pattern explicitly under
+  "split a large task into multiple language model sessions."
+- **No-progress watchdog (45 s)** — surfaces a clean `inferenceStalled`
+  error when the FM inference host dies silently mid-generation
+  (which it does on context overflow), instead of leaving the UI on
+  a stuck stop button.
 
 ---
 
@@ -352,8 +426,12 @@ If even fuzzy returns nothing, surface zero results honestly — the model will 
 Called from:
 - `SourcesCard` row tap → source: `"sources_tap"`
 - `WikilinkText` link tap → source: `"wikilink"`
-- `ReadNoteTool.run` → source: `"read_note"`
-- `ReadDailyNoteTool.run` (when note exists or is created) → source: `"daily_note"`
+- `ReadTool` path branch → source: `"read_note"`
+- `ReadTool` daily branch (when note exists) → source: `"daily_note"`
+
+(`FindTool` never records opens — it surfaces lists, it doesn't
+imply a read. The frecency signal comes from the subsequent `read`
+or Sources-card tap.)
 
 Single INSERT. Cheap. Async via `Task.detached(priority: .utility)` so taps stay responsive.
 
@@ -375,7 +453,7 @@ Minimal — Phase C is mostly tools + index.
 - `WikilinkText` tap handler: same pattern, source `"wikilink"`.
 - Vault Settings sheet (`⋯`): no new section in v1. If we have time, a tiny "Most opened notes" debug list under DEBUG would help validate frecency, but it's not required.
 
-No new screens, no new chat affordances. Empty-state suggestion chips updated to include "What notes do I have?" so the user can test `browse_vault` from the gate.
+No new screens, no new chat affordances. Empty-state suggestion chips updated to exercise the 2-tool surface end-to-end ("What notes do I have?" → `find`; "Open today's daily note." → `read`).
 
 ---
 
@@ -390,21 +468,24 @@ Sequential — earlier steps unblock later ones.
 5. ✅ **`FuzzyTitleMatcher`.** Levenshtein-based fallback in [FuzzyTitleMatcher.swift](./Sources/Services/Vault/FuzzyTitleMatcher.swift); wired as the zero-hits fallback after AND and OR passes.
 6. ✅ **`FrecencyTracker`.** Implemented in [FrecencyTracker.swift](./Sources/Services/Vault/FrecencyTracker.swift) with write side, exponential decay read side, 90-day prune.
 7. ✅ **Wire frecency into `VaultIndex.search`.** BM25 × `(1 + boost)` combined ranking live. Visible-rank validation deferred to device QA.
-8. ✅ **Wire open events into UI.** `read_note` / `read_daily_note` tools, Sources card opens via `openURL` interceptor in [ChatView.swift](./Sources/UI/ChatView.swift), wikilink taps via the same interceptor.
-9. ✅ **`BrowseVaultTool`.** New tool with `folder`, `tag`, `includeChildTags`, `sortBy`, `limit`, `offset` args; registered in [AppEnvironment.swift](./Sources/App/AppEnvironment.swift); empty-state chips updated.
-10. ✅ **Remove `ListRecentNotesTool` and `ListNotesByTagTool`.** Both source files deleted; registry slimmed to 8 tools; `make build` clean.
-11. ✅ **Sharpen tool descriptions.** `search_vault` description tightened to claim search prompts; `browse_vault` description spells out enumeration prompt shapes (recent, tagged, folder, "what notes do I have").
+8. ✅ **Wire open events into UI.** `ReadTool` (both branches) records opens; Sources card opens via `openURL` interceptor in [ChatView.swift](./Sources/UI/ChatView.swift); wikilink taps via the same interceptor.
+9. ✅ **`BrowseVaultTool`.** Originally shipped with `folder`, `tag`, `includeChildTags`, `sortBy`, `limit`, `offset` args. *Later absorbed into `FindTool` — see step 14.*
+10. ✅ **Remove `ListRecentNotesTool` and `ListNotesByTagTool`.** Both source files deleted, registry slimmed; `make build` clean.
+11. ✅ **Sharpen tool descriptions.** Long claim-style descriptions shipped first. *Inverted in step 14 — one-line descriptions are demonstrably better on AFM.*
 12. ✅ **Cleanup task.** Launch-time `FrecencyTracker.pruneOldOpens(...)` runs once per app launch from `AppEnvironment`.
-13. ⬜ **Device QA.** Real iPhone, real vault. All Phase-C deliverable bullets pass (including the two typo cases and the tag/recent prompts that now route to `browse_vault`). *Simulator QA done against a real vault; physical-device pass still pending.*
+13. ⬜ **Device QA.** Real iPhone, real vault. All Phase-C deliverable bullets pass using the post-refactor `find` / `read` surface. *Simulator QA done against a real vault; physical-device pass still pending.*
+14. ✅ **AFM-realistic tool consolidation.** Collapsed `SearchVaultTool`, `BrowseVaultTool`, `GetBacklinksTool` into [FindTool.swift](./Sources/Services/Tools/FindTool.swift); collapsed `ReadNoteTool`, `ReadDailyNoteTool` into [ReadTool.swift](./Sources/Services/Tools/ReadTool.swift); deleted `CreateNoteTool`, `DateTimeTool`, `CalculatorTool`. Tool registry shrank from 8 to 2 — under TN3193's recommended 3–5 ceiling. All tool descriptions compressed to one sentence. Empty-state chips updated to match.
+15. ✅ **Single tool call per turn.** [AgentService.swift](./Sources/Services/AgentService.swift) `TurnGuard` now hard-caps to `maxTotalCalls: 1` (single call). Multi-step intent ("find and read") becomes two user turns; the alternative was AFM speculatively chaining and overflowing context.
+16. ✅ **Zero transcript replay.** [AppleFoundationRunner.swift](./Sources/Services/AppleFoundationRunner.swift) no longer replays prior turns into the FM transcript. Each user prompt is treated as a fresh session, in line with TN3193's "split a large task into multiple language model sessions." Trades pronoun follow-ups ("what does it say?") for predictable per-turn budgets.
 
 #### Unplanned but completed during Phase C
 
-- **AFM 4096-token context defenses.** Real-world simulator QA against an Obsidian vault exposed that a single `browse_vault` page plus the model's bulleted reply, replayed across two turns, was overflowing Apple Foundation Models' 4096-token window — silently hanging the inference host with no thrown error. Added:
-  - **No-progress watchdog** in [AppleFoundationRunner.swift](./Sources/Services/AppleFoundationRunner.swift): if `streamResponse` produces no snapshot for 45s the runner emits an `inferenceStalled` error so the UI shows a red "Try again" row instead of staying on a stuck stop button.
-  - **Transcript trimming** (same file): keeps only the newest tail of history within a 6000-char budget before handing it to FM.
-  - **Per-turn dispatch guard** in [AgentService.swift](./Sources/Services/AgentService.swift): `browse_vault` is hard-capped to one call per assistant turn (the model could not be trusted to obey "call once" from prompt alone — it kept paginating and overflowing context).
-  - **Browse page hard cap of 10** in [BrowseVaultTool.swift](./Sources/Services/Tools/BrowseVaultTool.swift), with the tool description rewritten to embrace one-page-per-turn pagination ("ask 'more' for the next 10").
-  - **SwiftUI scroll-animation removal** in [ChatView.swift](./Sources/UI/ChatView.swift): per-token `withAnimation { scrollTo }` was triggering a `ViewLayoutEngine.sizeThatFits` layout cycle on long assistant messages, freezing the main thread. Bare `scrollTo` without animation is plenty for tail-following during streaming.
+The original Phase C plan assumed an 8-tool surface, browse pages of 25, transcript replay, and "claim every prompt shape" tool descriptions. Real-world simulator QA against an Obsidian vault made AFM's 4096-token ceiling the binding constraint and forced a series of corrections, culminating in the AFM-realistic refactor (steps 14–16 above). Companion fixes:
+
+- **No-progress watchdog** in [AppleFoundationRunner.swift](./Sources/Services/AppleFoundationRunner.swift): if `streamResponse` produces no snapshot for 45s the runner emits an `inferenceStalled` error so the UI shows a red "Try again" row instead of staying on a stuck stop button. (Apple's FM inference host can die mid-generation on context overflow without throwing.)
+- **`AgentError.humanize`** in [AgentService.swift](./Sources/Services/AgentService.swift): translates raw `LanguageModelSession.GenerationError` stringifications into user-actionable text (`"The model couldn't generate a response…"`, `"…too long for the on-device model…"`).
+- **SwiftUI scroll-animation removal** in [ChatView.swift](./Sources/UI/ChatView.swift): per-token `withAnimation { scrollTo }` was triggering a `ViewLayoutEngine.sizeThatFits` layout cycle on long assistant messages, freezing the main thread. Bare `scrollTo` without animation is plenty for tail-following during streaming.
+- **BM25 title weight bumped from 10 → 100** in [VaultIndex.swift](./Sources/Services/Vault/VaultIndex.swift): exact-title queries (e.g. searching for the literal title of a note) were being out-ranked by many short backlinking notes whose bodies mentioned the title. 100× restored title primacy.
 
 ---
 
@@ -412,25 +493,37 @@ Sequential — earlier steps unblock later ones.
 
 Before declaring Phase C done, every item below must be demonstrably true:
 
+Updated post-AFM-realistic refactor — prompts now name `find` / `read` instead of the original 8 tools. Each test below should be run **in a fresh chat** (zero transcript replay means follow-ups inside the same chat don't help).
+
 - [ ] On a fresh install: vault binds, scan completes, search returns BM25-ranked hits for any keyword present in the vault.
 - [ ] On an upgrade from Phase B: existing DB migrates to v2, FTS5 table backfills, no data loss.
-- [x] "What notes do I have" routes to `browse_vault` and returns the first page sorted by modified. *(Verified in simulator QA against a real vault.)*
-- [ ] "List notes in my Projects folder" routes to `browse_vault` with `folder='Projects'` and returns only Projects/ notes.
-- [ ] "Show me my #project notes" routes to `browse_vault` with `tag='project'` (formerly the job of `list_notes_by_tag`); hierarchical children like `#project/work` are included by default.
-- [ ] "What have I been working on lately" routes to `browse_vault` with `sortBy='modified'` (formerly the job of `list_recent_notes`).
-- [x] `list_recent_notes` and `list_notes_by_tag` are gone — `AppEnvironment.defaultTools(...)` returns exactly 8 tools.
+- [x] **Registry is exactly 2 tools.** `AppEnvironment.defaultTools(...)` returns `[FindTool, ReadTool]`. (`list_recent_notes`, `list_notes_by_tag`, `search_vault`, `browse_vault`, `read_note`, `read_daily_note`, `get_backlinks`, `create_note`, `datetime`, `calculator` all gone.)
+- [x] **"What notes do I have"** routes to `find` (no args) → 10 recent notes. *(Verified in simulator QA against a real vault.)*
+- [ ] **"List notes in my Projects folder"** routes to `find(folder: "Projects")` and returns only Projects/ notes.
+- [ ] **"Show me my #project notes"** routes to `find(tag: "project")`; hierarchical children like `#project/work` are included by default.
+- [ ] **"What have I been working on lately"** routes to `find` with no args (recency default).
+- [ ] **"Find notes about productivity"** routes to `find(query: "productivity")`.
+- [ ] **"What links to [[Master Branch]]"** routes to `find(linked_to: "Master Branch.md")` (model derives the path heuristically).
+- [ ] **"Read Projects/Obelisk.md"** routes to `read(path: "Projects/Obelisk.md")` and returns the preview body.
+- [ ] **"Open today's daily note"** routes to `read(daily: "today")` and returns the note (or `{ exists: false }` payload that the model paraphrases).
+- [ ] **Single-tool-per-turn guard fires** when AFM speculatively chains: the second tool call comes back with the `TurnGuard.overBudget` amber row and the model proceeds to reply with the data it already has.
 - [ ] Multi-word query like "productivity tips" returns notes where both words appear (AND first pass); if zero, returns notes where either word appears (OR fallback).
 - [ ] Title hits rank above body-only hits for the same query.
 - [ ] **Single-token typo**: "zetlekasten" (real note: "Zettelkasten") returns the right note. Vocab correction should rewrite it; if not, fuzzy fallback catches it. `SearchQuery.corrections` (logged in DEBUG) shows the rewrite when it happened.
-- [ ] **Multi-token query with one typo**: "productiviy meeting notes" returns the same hits as "productivity meeting notes" — *not* zero. Confirms vocab correction is fixing the AND pass, not silently dropping the bad token.
+- [ ] **Multi-token query with one typo**: "productiviy meeting notes" returns the same hits as "productivity meeting notes" — *not* zero.
 - [ ] **Phrase typo bypass**: `"zetlekasten"` quoted returns zero (or only true substring matches) — phrases must not be vocab-corrected.
 - [ ] **Short-token bypass**: a 3-char query like "cat" is not auto-corrected to "bat" or any other 3-char vocab word.
 - [ ] **Cold start**: with an empty vocab cache (first query after launch), search still works — falls through to OR pass and fuzzy as needed without crashing.
 - [ ] Opening a note via Sources card 5× and then searching for a term that returns that note + others ranks it visibly higher than before the opens.
 - [ ] `obsidian://open?vault=…&file=…` deep links still work from the Sources card.
-- [ ] No regressions on Phase B's validation checklist — all 13 items still pass.
 - [ ] FTS5 integrity check (`INSERT INTO notes_fts(notes_fts) VALUES('integrity-check')`) reports clean after a full scan.
-- [ ] 20-minute mixed-usage soak: search, browse, daily notes, create note, change vault. No crashes, no slow queries (all under 200ms on a 5,000-note vault).
+- [ ] 20-minute mixed-usage soak: `find`, `read`, daily-note reads, change vault. No crashes, no slow queries (all under 200ms on a 5,000-note vault).
+
+#### Superseded by the AFM-realistic refactor (do not re-test)
+
+- ~~"What links to X" routes to `get_backlinks`~~ → now `find(linked_to: …)`.
+- ~~"Save / create a note" routes to `create_note`~~ → write path deferred to a future `write` tool.
+- ~~Phase B regression pass on 13 items~~ → Phase B's tool surface no longer exists; replaced by Phase C's 2-tool surface and Phase C's validation list above.
 
 ---
 
@@ -453,7 +546,25 @@ Before declaring Phase C done, every item below must be demonstrably true:
 
 What Phase D will inherit and what it must not break:
 
+- **Tool surface is exactly `find` + `read`.** Any new agent capability must either ride one of these (preferred) or stay under the 3–5 tool ceiling AFM can route reliably. The simplest extension on the horizon is a `write` tool (see "Open dependencies" below) — that becomes tool #3, no further additions without an explicit budget discussion.
 - The `note_opens` table is the project's first "user behavior" datastore. Phase D (voice) doesn't touch it directly, but if voice ever surfaces a "most-talked-about notes" list, it reads from here.
 - `QueryParser` is a pure function — voice input that becomes a chat message routes through it the same as typed input. No phase-c-specific assumptions.
 - The FTS5 schema is additive over Phase B's migration v1 — no Phase D migration needed unless voice introduces its own tables.
 - All Phase C UI hooks live in the existing chat shell. Phase D's mic affordance lands next to the existing input row without touching search/browse code.
+
+### Standing AFM discipline rules
+
+These were learned the hard way during the Phase C refactor and apply to **every future tool / prompt addition** until a second `LLMRunner` (with a wider context window) ships:
+
+1. **Tool budget: 3 max, 5 hard ceiling** (TN3193). Adding a tool requires deleting / merging another, not just appending.
+2. **One-line tool descriptions.** No claim-stacking, no "use this when…" overlap.
+3. **One tool call per assistant turn.** Enforced in `AgentService.TurnGuard`. Multi-step intent becomes multi-turn dialog.
+4. **Zero transcript replay.** Each user prompt is a fresh session to FM. If a feature *requires* memory of prior turns, build it on top of router/worker session splitting (TN3193), not by re-enabling replay.
+5. **Prefer pre-routing over agentic routing for unambiguous intents.** If a user prompt has exactly one reasonable tool call (e.g. "open today's daily"), detect in Swift, run the tool, inject the result into the prompt, and call FM with *no tools registered* for that turn.
+6. **Keep tool payloads small.** No snippets, no duplicated rows, no debugging metadata. The model only needs enough to either reply or call a follow-up tool.
+
+### Open dependencies into later phases
+
+- **`write` tool.** Phase B originally shipped `CreateNoteTool`; it was removed during the AFM-realistic refactor. Phase E (capture / Share Sheet / `obelisk/inbox/`) implicitly needs a write path. Bring it back as the third tool (`write(path?, title?, body, mode: create|append|replace, folder?)`), still well inside the 3–5 ceiling. The "do no harm" rules in [roadmap.md §"The 'do no harm' rules for vault writes"](./roadmap.md) all carry forward verbatim.
+- **Conversation history.** Voice (Phase D) makes follow-ups ("read it", "more") natural again. Zero transcript replay doesn't fit that. The clean solution per TN3193 is router/worker session splitting (session A picks tool + args, Swift runs it, session B narrates with the tool result inlined). Worth piloting before voice ships.
+- **Second `LLMRunner`.** Phase F's Settings model picker is "deferred until a second `LLMRunner` exists." If AFM remains the only backend, several of these discipline rules become permanent rather than temporary.

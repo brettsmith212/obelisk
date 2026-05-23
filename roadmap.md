@@ -144,6 +144,8 @@ A throwaway todo app: add items, mark complete, persist with `@AppStorage` or `S
 ## Phase A: Text-only chat agent (4–6 weeks)
 
 > **Status: ✅ Complete** — see [phase-a.md](./phase-a.md) for the execution log. Three on-device tools (`datetime`, `calculator`, `scratchpad`) wire end-to-end through Foundation Models with multi-turn `Transcript` history; chat shell ships drawer, edit, regenerate, stop, and inline error tiers per [ui-spec.md](./ui-spec.md). Physical-device QA on iPhone 15 Pro / 16 Pro is the only open thread.
+>
+> **Footnote (Phase C):** `datetime`, `calculator`, and `scratchpad` were all subsequently removed from the production tool registry during Phase C's AFM-realistic refactor (`scratchpad` superseded by vault tools in Phase B; `datetime` and `calculator` deleted as demo-only). The Phase A wiring against the `LLMRunner` seam still stands and is what Phase C's `find` / `read` tools ride on.
 
 This is the foundation. Everything else sits on it. Don't rush.
 
@@ -256,6 +258,8 @@ You can have a multi-turn conversation, the model uses all three tools when appr
 ## Phase B: Vault connection and Obsidian primitives (4–6 weeks)
 
 > **Status: ✅ Complete** — see [phase-b.md](./phase-b.md) for the execution log. Vault binding via document picker + security-scoped bookmark (with sample-vault `#if DEBUG` shortcut for the simulator), GRDB-backed `notes`/`links`/`tags` index with full + incremental SHA-256 scanning, all six read tools + `CreateNoteTool` wired through the existing `LLMRunner` seam, denylist-gated writes with `source: obelisk` enforcement and atomic temp+replace, Sources card + wikilink rendering in the chat shell, iCloud placeholder gate, Vault Settings sheet with deny-list editor. Device QA passed on iPhone with a real iCloud Obsidian vault — `create_note` defaults to vault root to match Obsidian's manual-create behavior. Known gaps deferred to later phases: no full-vault enumeration tool (Phase C semantic search supersedes), no body-edit / append tool, Periodic Notes plugin config not read (only core daily-notes.json).
+>
+> **Footnote (Phase C):** Phase B's six read tools collapsed into Phase C's `find` and `read` (see Phase C's "Tools after Phase C" table). `CreateNoteTool` was also deleted; a dedicated `write` tool will land before Phase E's capture flows ship (it is the implicit dependency for Share Sheet / Action Button writes into `obelisk/inbox/`). The denylist-gated `VaultWriter` infrastructure from this phase stays intact and is what the future `write` tool will ride on — none of the "do no harm" rules need re-deriving.
 
 Before Obelisk can be useful, it needs to be able to safely read and reason about an Obsidian vault. This phase is the parsing and access layer.
 
@@ -403,20 +407,24 @@ All on built-in SQLite. No new packages. No model download. No vector storage. N
 
 **5. Frecency layer.** New `note_opens(path, opened_at)` table. Insert a row whenever the user opens a note via the Sources card tap, whenever `read_note` or `read_daily_note` runs, whenever a wikilink is tapped in an assistant turn. Compute a per-note frecency score with exponential decay (Mozilla-style: `Σ exp(-λ × days_since_open)`, 10-day half-life). Combine with BM25: `final = bm25_score * (1 + frecency_factor)`. Notes you've never opened still rank; notes you live in jump.
 
-**6. Sharpened tool description.** Single `search_vault` with a description that claims every "find / search / look up / show me notes about / what have I written about" prompt. `browse_vault` claims every "list / enumerate / what notes do I have / show me my vault" prompt. No naming overlap — the model picks the right one by intent shape, not by guessing between near-duplicate names.
+**6. Tool descriptions: short, orthogonal, scarce.** First pass shipped long claim-style descriptions on `search_vault` and `browse_vault`. AFM routing was unreliable: shared vocabulary ("vault notes") confused the model and the long descriptions ate scarce schema budget. Inverted late in Phase C — see the "Tools after Phase C" table above. The standing rule (carried into Phase D and beyond): keep tool count under 3, descriptions to one sentence, payloads small. Logged as standing AFM discipline in [phase-c.md §13](./phase-c.md).
 
 ### Tools after Phase C
 
+Originally specified as 8 tools (the Phase B six minus two enumeration tools plus the new `browse_vault`). Simulator QA against a real Obsidian vault made AFM's 4096-token ceiling the binding constraint and forced a deeper consolidation. The post-refactor surface:
+
 | Tool | Status |
 |------|--------|
-| `search_vault` | Upgraded — FTS5 + BM25 + vocab correction + fuzzy fallback + frecency boost |
-| `browse_vault` | **New** — paginated enumeration with `folder` / `tag` / `includeChildTags` / `sortBy` / `limit` / `offset`; absorbs the two removals below |
-| `list_recent_notes` | **Removed** — covered by `browse_vault(sortBy="modified", limit=N)` |
-| `list_notes_by_tag` | **Removed** — covered by `browse_vault(tag=…, includeChildTags=…)` |
-| `read_note`, `get_backlinks`, `read_daily_note`, `create_note` | Unchanged from Phase B |
-| `datetime`, `calculator` | Unchanged from Phase A |
+| `find` | **New** — single retrieval verb. `query` → FTS5 keyword search; `tag` / `folder` → filtered enumeration; `linked_to` → backlinks; no args → newest-modified browse. Absorbs `search_vault`, `browse_vault`, `get_backlinks`. |
+| `read` | **New** — single read verb. `path` → any vault note; `daily` → date-based daily note (resolved via `.obsidian/daily-notes.json`). Strictly read-only. Absorbs `read_note` and `read_daily_note`. |
+| `search_vault`, `browse_vault`, `get_backlinks`, `read_note`, `read_daily_note` | **Removed** — absorbed by `find` / `read`. |
+| `create_note` | **Removed** — write path deferred to a dedicated `write` tool (Phase E dependency). |
+| `list_recent_notes`, `list_notes_by_tag` | **Removed** — absorbed by `find`. |
+| `datetime`, `calculator` | **Removed** — Phase A demo tools; no product value in a vault assistant, and burned schema tokens for free. |
 
-Total: **8 tools** (Phase B had 8; Phase C adds 1 and removes 2). Comfortably under the 10-tool ceiling. Each tool now claims a distinct prompt shape, eliminating the near-duplicate enumeration ambiguity Phase B QA hit.
+Total: **2 tools.** Under Apple's [TN3193](https://developer.apple.com/documentation/technotes/tn3193-managing-the-on-device-foundation-model-s-context-window) recommended 3–5 ceiling, with room for the future `write` tool. AFM's routing decision shrinks to a single binary — "which notes?" (`find`) vs. "what's in *this* note?" (`read`) — which a ~3B model actually handles reliably.
+
+See [phase-c.md §5](./phase-c.md) for the full reasoning and the companion `AgentService` guards (single tool call per turn, zero transcript replay) that ship alongside the slimmed registry.
 
 ### What this does NOT do
 
@@ -615,6 +623,8 @@ A TestFlight build with onboarding, settings, error handling, and at least one f
 
 ## Deferred (out of v1)
 
+- **`write` tool (vault mutation).** Phase B originally shipped `CreateNoteTool`; Phase C's AFM-realistic refactor removed it because the read story was the binding bottleneck and a 6-tool surface was already too wide for AFM. The write path must come back before Phase E (capture / Share Sheet / `obelisk/inbox/`) — those flows implicitly require writing to the vault. Spec: a single `write(path?, title?, body, mode: create|append|replace, folder?)` tool, ridden by both the model and the in-app capture intents. The `VaultWriter` infrastructure from Phase B (denylist gating, `source: obelisk` enforcement, atomic temp+replace) stays intact — only the *tool surface* needs rebuilding. Becomes tool #3, still inside Apple's 3–5 recommended ceiling.
+- **Conversation history that survives across turns.** Zero transcript replay shipped in Phase C as the only way to keep AFM's 4096-token window from overflowing on multi-step intents. Voice (Phase D) will make follow-ups ("read it", "more") naturally common again. The clean fix per [Apple TN3193](https://developer.apple.com/documentation/technotes/tn3193-managing-the-on-device-foundation-model-s-context-window) is router/worker session splitting (session A picks tool + args, Swift runs it, session B narrates with the tool result inlined). Pilot before voice ships; revisit replay only if pilot fails.
 - **Semantic search via embeddings.** The original Phase C plan. Moved here based on (a) industry consensus that agentic lexical search outperforms RAG for code-shaped corpora and (b) Phase B device-QA evidence that the failure modes we hit were enumeration and weak keyword matching, not the semantic gap. Phase C v2 (FTS5 + fuzzy + frecency + browse) covers the observed needs without an embedding pipeline. If dogfooding surfaces real semantic misses ("what have I written about X" failing when X never appears verbatim), revisit: the `embeddings` table is reserved and `MarkdownChunker` is ready to plug in. When built, add as a sibling `semantic_search_vault` tool, not as a replacement.
 - **MLX backend (`MLXRunner`).** A second `LLMRunner` implementation using MLX-Swift for users who want a different/larger model, fewer content guardrails, or who are on devices without Apple Intelligence. The v1 protocol is designed so this can be added without touching `AgentService` or the tools — but the implementation itself is deferred. When built: clone `mlx-swift-examples`, study LLMEval/LLMChat, strip to the smallest model load + generate + tool-call loop.
 - **Model picker UI.** Settings screen to switch between `LLMRunner` backends, download/manage MLX models, etc. Only meaningful once a second runner exists.
