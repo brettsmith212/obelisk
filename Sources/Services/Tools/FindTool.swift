@@ -23,7 +23,7 @@ struct FindTool: Tool {
             "query":     .string(description: "Free-text keyword search."),
             "tag":       .string(description: "Tag filter, no '#'."),
             "folder":    .string(description: "Vault-relative folder prefix."),
-            "linked_to": .string(description: "Vault-relative path; returns notes that wikilink to it."),
+            "linked_to": .string(description: "Note title OR vault-relative path; returns notes that wikilink to it."),
             "limit":     .integer(description: "Max notes. Default 10, cap 10."),
             "offset":    .integer(description: "Skip count for paging browse results."),
         ],
@@ -51,7 +51,14 @@ struct FindTool: Tool {
 
         // 1) Backlinks mode wins if `linked_to` is set.
         if let linkedTo {
-            let rows = try index.backlinks(to: linkedTo, limit: limit)
+            // The model often passes a title (or a `[[Wikilink]]`)
+            // rather than a path — it has no way to know the actual
+            // vault layout, and we cap at one tool call per turn so
+            // it can't look it up first. Resolve in Swift.
+            guard let resolved = try index.resolveNotePath(forTitleOrPath: linkedTo) else {
+                return Self.envelope(notes: [], citations: [])
+            }
+            let rows = try index.backlinks(to: resolved, limit: limit)
             return Self.envelope(
                 notes: rows.map { ($0.path, $0.title) },
                 citations: rows.compactMap { (try? index.citation(forPath: $0.path))?.jsonValue }

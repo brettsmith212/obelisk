@@ -148,6 +148,67 @@ final class VaultIndex {
         }
     }
 
+    /// Resolve a user-supplied "what is this note?" string to a
+    /// vault-relative path. Accepts:
+    ///   - a real vault path (returned as-is if it matches `notes.path`)
+    ///   - a `[[Wikilink]]` (brackets stripped, then title-resolved)
+    ///   - a bare title (case-insensitive match against `notes.title`,
+    ///     `.md` suffix stripped)
+    ///
+    /// Used by `FindTool` so the model can pass "Master Branch" without
+    /// having to know whether the note lives in the vault root or in a
+    /// subfolder — AFM cannot make that distinction without a lookup
+    /// tool of its own, and we cap at one tool call per turn.
+    ///
+    /// Title collisions: returns the first matching path; if the user
+    /// has two notes with the same title in different folders we
+    /// arbitrarily pick the older one (path ASC) for now. Acceptable
+    /// until dogfooding surfaces a real conflict.
+    func resolveNotePath(forTitleOrPath raw: String) throws -> String? {
+        let cleaned = raw
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "[[", with: "")
+            .replacingOccurrences(of: "]]", with: "")
+            .trimmingCharacters(in: .whitespaces)
+        guard !cleaned.isEmpty else { return nil }
+
+        return try dbQueue.read { db in
+            // Exact-path hit (with or without `.md` suffix).
+            if let path: String = try String.fetchOne(
+                db,
+                sql: "SELECT path FROM notes WHERE path = ? LIMIT 1",
+                arguments: [cleaned]
+            ) {
+                return path
+            }
+            let withMD = cleaned.hasSuffix(".md") ? cleaned : cleaned + ".md"
+            if withMD != cleaned,
+               let path: String = try String.fetchOne(
+                db,
+                sql: "SELECT path FROM notes WHERE path = ? LIMIT 1",
+                arguments: [withMD]
+               ) {
+                return path
+            }
+            // Title fallback. Strip `.md` so users can pass either
+            // shape and a case-insensitive compare so "master branch"
+            // matches "Master Branch".
+            let titleGuess = cleaned.hasSuffix(".md")
+                ? String(cleaned.dropLast(3))
+                : cleaned
+            return try String.fetchOne(
+                db,
+                sql: """
+                    SELECT path FROM notes
+                    WHERE LOWER(title) = LOWER(?)
+                    ORDER BY path ASC
+                    LIMIT 1
+                    """,
+                arguments: [titleGuess]
+            )
+        }
+    }
+
     /// Backlinks to a given note (any other note whose `links.target_path`
     /// resolved to this path). Unresolved links are intentionally
     /// excluded — we don't know the user meant *this* note.
